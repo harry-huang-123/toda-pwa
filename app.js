@@ -16,7 +16,7 @@ async function addTask() {
   });
 
   textEl.value = "";
-  timeEl.value = "";
+  setDefaultTime(); // 新增後再幫你設回現在
   load();
 }
 
@@ -60,18 +60,21 @@ async function editTask(id, oldText) {
   await fs.updateDoc(fs.doc(db, "tasks", id), { text: t });
   load();
 }
-now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+
+/* ---------- 預設時間（關鍵） ---------- */
+function setDefaultTime() {
+  const timeEl = document.getElementById("time");
+  const now = new Date();
+
+  // 🔥 修正時區（iOS / Chrome 都正常）
+  now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+
+  timeEl.value = now.toISOString().slice(0, 16);
+}
 
 /* ---------- DOM Ready ---------- */
 document.addEventListener("DOMContentLoaded", () => {
-  // 🔥 預設時間 = 現在
-  const timeEl = document.getElementById("time");
-  const now = new Date();
-  now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
-  timeEl.value = now.toISOString().slice(0, 16);
-
+  setDefaultTime(); // 一進頁面就設今天
   document.getElementById("addBtn").addEventListener("click", addTask);
   load();
 });
-
-
