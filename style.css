@@ -78,3 +78,51 @@ li .del {
   background: #ff3b30;
   color: white;
 }
+/* 每一筆代辦卡片 */
+.task-card {
+  background: #f2f2f7;
+  border-radius: 14px;
+  padding: 14px;
+  margin-bottom: 14px;
+}
+
+/* 事項文字 */
+.task-text {
+  font-size: 16px;
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+
+/* 時間顯示 */
+.task-time {
+  font-size: 13px;
+  color: #666;
+  margin-bottom: 10px;
+}
+
+/* 操作按鈕區 */
+.task-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+/* 按鈕統一尺寸 */
+.task-actions button {
+  padding: 6px 14px;
+  border-radius: 10px;
+  border: none;
+  font-size: 14px;
+}
+
+/* 編輯 */
+.task-actions .edit {
+  background: #ffd60a;
+}
+
+/* 刪除 */
+.task-actions .del {
+  background: #ff3b30;
+  color: white;
+}
