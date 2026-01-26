@@ -1,21 +1,34 @@
-// Import the functions you need from the SDKs you need
-import { initializeApp } from "firebase/app";
-import { getAnalytics } from "firebase/analytics";
-// TODO: Add SDKs for Firebase products that you want to use
-// https://firebase.google.com/docs/web/setup#available-libraries
+// firebase.js
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+import {
+  getFirestore,
+  collection,
+  addDoc,
+  getDocs,
+  deleteDoc,
+  updateDoc,
+  doc
+} from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
 
-// Your web app's Firebase configuration
-// For Firebase JS SDK v7.20.0 and later, measurementId is optional
 const firebaseConfig = {
-  apiKey: "AIzaSyDxud_UEWbzW5QFrxmpWyR7eSBGupVgxzU",
+  apiKey: "AIzaSyDxdU_EWbzW5QFrxmpWyR7eSBGupVgxzU",
   authDomain: "todo-reminder-1f382.firebaseapp.com",
   projectId: "todo-reminder-1f382",
-  storageBucket: "todo-reminder-1f382.firebasestorage.app",
+  storageBucket: "todo-reminder-1f382.appspot.com",
   messagingSenderId: "267299790273",
-  appId: "1:267299790273:web:822c2b0e6f4ab6c0c06340",
-  measurementId: "G-WCVPJCTKDW"
+  appId: "1:267299790273:web:822c2b0e6f4ab6c0c06340"
 };
 
-// Initialize Firebase
 const app = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app);
+const db = getFirestore(app);
+
+// 🔥 關鍵：掛到 window，讓 app.js 用得到
+window.db = db;
+window.fs = {
+  collection,
+  addDoc,
+  getDocs,
+  deleteDoc,
+  updateDoc,
+  doc
+};
