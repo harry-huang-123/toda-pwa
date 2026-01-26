@@ -4,18 +4,22 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width">
   <title>待辦提醒</title>
+
   <link rel="manifest" href="manifest.json">
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <h2>待辦提醒</h2>
+  <div class="app">
+    <h2>待辦提醒</h2>
 
-  <input id="text" placeholder="待辦事項">
-  <input id="time" type="datetime-local">
+    <div class="input-group">
+      <input id="text" placeholder="待辦事項">
+      <input id="time" type="datetime-local">
+      <button id="addBtn">新增</button>
+    </div>
 
-  <!-- ✅ 一定要有 id，而且不要 onclick -->
-  <button id="addBtn">新增</button>
-
-  <ul id="list"></ul>
+    <ul id="list"></ul>
+  </div>
 
   <script type="module" src="firebase.js"></script>
   <script type="module" src="app.js"></script>
