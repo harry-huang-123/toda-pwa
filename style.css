@@ -79,6 +79,7 @@ li .del {
   color: white;
 }
 /* 每一筆代辦卡片 */
+/* 每一筆代辦卡片 */
 .task-card {
   background: #f2f2f7;
   border-radius: 14px;
@@ -91,26 +92,27 @@ li .del {
   font-size: 16px;
   font-weight: 500;
   margin-bottom: 6px;
+  word-break: break-word;
 }
 
-/* 時間顯示 */
+/* 時間（一定獨立一行） */
 .task-time {
   font-size: 13px;
   color: #666;
-  margin-bottom: 10px;
+  margin-bottom: 12px;
 }
 
-/* 操作按鈕區 */
+/* 按鈕區（固定一排，永遠置中） */
 .task-actions {
   display: flex;
   justify-content: center;
-  gap: 10px;
-  margin-top: 8px;
+  gap: 14px;
 }
 
-/* 按鈕統一尺寸 */
+/* 所有按鈕統一尺寸 */
 .task-actions button {
-  padding: 6px 14px;
+  min-width: 72px;
+  padding: 8px 0;
   border-radius: 10px;
   border: none;
   font-size: 14px;
@@ -126,3 +128,4 @@ li .del {
   background: #ff3b30;
   color: white;
 }
+
