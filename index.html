@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width">
+  <title>待辦提醒</title>
+  <link rel="manifest" href="manifest.json">
+</head>
+<body>
+  <h2>待辦提醒</h2>
+
+  <input id="text" placeholder="待辦事項">
+  <input id="time" type="datetime-local">
+  <button onclick="addTask()">新增</button>
+
+  <ul id="list"></ul>
+
+  <script type="module" src="firebase.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
