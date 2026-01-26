@@ -12,7 +12,7 @@ async function addTask() {
 
   await fs.addDoc(fs.collection(db, "tasks"), {
     text: textEl.value,
-    time: timeEl.value   // 存的是 "2025-04-10T14:30" 這種本地格式字串
+    time: timeEl.value // 存的是 "2025-04-10T14:30" 這種本地格式字串
   });
 
   textEl.value = "";
@@ -35,7 +35,6 @@ function render() {
   tasks.forEach(t => {
     const li = document.createElement("li");
     li.className = "task-card";
-
     li.innerHTML = `
       <div class="task-text">${t.text}</div>
       <div class="task-time">${new Date(t.time).toLocaleString()}</div>
@@ -47,36 +46,43 @@ function render() {
 
     li.querySelector(".edit").addEventListener("click", () => editTask(t.id, t.text));
     li.querySelector(".del").addEventListener("click", () => delTask(t.id));
-
     list.appendChild(li);
   });
 }
-// ---------- 刪除 ----------
-/* ---------- 刪除 ---------- */
-async function delTask(id) {
-  await fs.deleteDoc(fs.doc(db, "tasks", id));
-  load();
-}
 
+// ---------- 刪除 ----------
+async function delTask(id) {
+  if (!confirm("確定要刪除這筆事項嗎？")) return;
+  
+  try {
+    await fs.deleteDoc(fs.doc(db, "tasks", id));
+    load();
+  } catch (e) {
+    console.error("刪除失敗:", e);
+    alert("刪除失敗，請稍後再試");
+  }
+}
 
 // ---------- 編輯 ----------
 async function editTask(id, oldText) {
   const newText = prompt("修改事項", oldText);
   if (!newText) return;
 
-  await fs.updateDoc(fs.doc(db, "tasks", id), { text: newText });
-  load();
+  try {
+    await fs.updateDoc(fs.doc(db, "tasks", id), { text: newText });
+    load();
+  } catch (e) {
+    console.error("編輯失敗:", e);
+    alert("修改失敗，請稍後再試");
+  }
 }
 
-// ---------- 預設時間（修正時區，讓 <input type="datetime-local"> 顯示本地時間） ----------
+// ---------- 預設時間（讓 datetime-local 顯示本地時間） ----------
 function setDefaultTime() {
   const timeEl = document.getElementById("time");
   const now = new Date();
-
-  // 關鍵修正：把分鐘加上時區偏移，得到本地時間的 ISO 字串前半段
+  // 修正為本地時間格式
   now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
-
-  // 產生 yyyy-MM-ddThh:mm 格式（datetime-local 需要的格式）
   timeEl.value = now.toISOString().slice(0, 16);
 }
 
@@ -86,7 +92,3 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("addBtn").addEventListener("click", addTask);
   load();                              // 載入資料
 });
-
-
-
-
