@@ -21,10 +21,15 @@ async function addTask() {
   load();
 }
 
+// 🔥 關鍵這一行
+window.addTask = addTask;
+
+
 async function del(id) {
   await fs.deleteDoc(fs.doc(db, "tasks", id));
   load();
 }
+window.del = del;
 
 async function edit(id, old) {
   const t = prompt("修改事項", old);
@@ -32,6 +37,7 @@ async function edit(id, old) {
   await fs.updateDoc(fs.doc(db, "tasks", id), { text: t });
   load();
 }
+window.edit = edit;
 
 function render() {
   list.innerHTML = "";
@@ -45,5 +51,6 @@ function render() {
     list.appendChild(li);
   });
 }
+window.render = render;
 
 load();
