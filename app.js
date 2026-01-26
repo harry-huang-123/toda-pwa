@@ -66,8 +66,7 @@ function setDefaultTime() {
   const timeEl = document.getElementById("time");
   const now = new Date();
 
-  // 🔥 修正時區（iOS / Chrome 都正常）
-  now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+
 
   timeEl.value = now.toISOString().slice(0, 16);
 }
@@ -78,3 +77,4 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("addBtn").addEventListener("click", addTask);
   load();
 });
+
