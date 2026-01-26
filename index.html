@@ -11,13 +11,13 @@
 
   <input id="text" placeholder="待辦事項">
   <input id="time" type="datetime-local">
-  <button onclick="addBtn()">新增</button>
+
+  <!-- ✅ 一定要有 id，而且不要 onclick -->
+  <button id="addBtn">新增</button>
 
   <ul id="list"></ul>
 
   <script type="module" src="firebase.js"></script>
-   <script type="module" src="app.js"></script>
-
+  <script type="module" src="app.js"></script>
 </body>
 </html>
-
