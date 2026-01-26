@@ -1,21 +1,43 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <title>CHECK_TASK</title>
+</head>
 <body>
+
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-  import { getFirestore, collection, getDocs } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+  import {
+    getFirestore,
+    collection,
+    getDocs
+  } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
 
+  // 🔥 一定要跟 firebase.js 完全一樣
   const firebaseConfig = {
-    apiKey: "同上",
-    authDomain: "同上",
-    projectId: "同上"
+    apiKey: "AIzaSyDxud_UEWbzW5QFrxmpWyR7eSBGupVgxzU",
+    authDomain: "todo-reminder-1f382.firebaseapp.com",
+    projectId: "todo-reminder-1f382",
+    storageBucket: "todo-reminder-1f382.appspot.com",
+    messagingSenderId: "267299790273",
+    appId: "1:267299790273:web:822c2b0e6f4ab6c0c06340"
   };
 
   const app = initializeApp(firebaseConfig);
   const db = getFirestore(app);
 
+  // 🔍 只做一件事：檢查 tasks 有沒有資料
   const snap = await getDocs(collection(db, "tasks"));
-  document.title = snap.size > 0 ? "HAS_TASK" : "NO_TASK";
+
+  if (snap.size > 0) {
+    document.title = "HAS_TASK";
+    document.body.innerText = "HAS_TASK";
+  } else {
+    document.title = "NO_TASK";
+    document.body.innerText = "NO_TASK";
+  }
 </script>
+
 </body>
 </html>
