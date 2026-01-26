@@ -16,7 +16,7 @@ async function addTask() {
   });
 
   textEl.value = "";
-  setDefaultTime(); // 新增後再幫你設回現在
+  setDefaultTime(); // 新增後重設為現在
   load();
 }
 
@@ -61,13 +61,13 @@ async function editTask(id, oldText) {
   load();
 }
 
-/* ---------- 預設時間（關鍵） ---------- */
+/* ---------- 預設時間（唯一使用 now 的地方） ---------- */
 function setDefaultTime() {
   const timeEl = document.getElementById("time");
   const now = new Date();
 
-
-
+  // 修正時區
+  now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
   timeEl.value = now.toISOString().slice(0, 16);
 }
 
@@ -77,4 +77,3 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("addBtn").addEventListener("click", addTask);
   load();
 });
-
