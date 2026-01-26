@@ -52,10 +52,8 @@ function render() {
   });
 }
 // ---------- 刪除 ----------
+/* ---------- 刪除 ---------- */
 async function delTask(id) {
-  const ok = confirm("確定要刪除這筆待辦嗎？");
-  if (!ok) return;
-
   await fs.deleteDoc(fs.doc(db, "tasks", id));
   load();
 }
@@ -88,6 +86,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("addBtn").addEventListener("click", addTask);
   load();                              // 載入資料
 });
+
 
 
 
