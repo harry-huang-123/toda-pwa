@@ -53,12 +53,6 @@ function render() {
 }
 
 
-// ---------- 刪除 ----------
-async function delTask(id) {
-  await fs.deleteDoc(fs.doc(db, "tasks", id));
-  load();
-}
-
 // ---------- 編輯 ----------
 async function editTask(id, oldText) {
   const newText = prompt("修改事項", oldText);
@@ -86,4 +80,5 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("addBtn").addEventListener("click", addTask);
   load();                              // 載入資料
 });
+
 
