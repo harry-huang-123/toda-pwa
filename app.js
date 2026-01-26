@@ -1,6 +1,6 @@
 let tasks = [];
 
-/* ---------- 新增 ---------- */
+// ---------- 新增 ----------
 async function addTask() {
   const textEl = document.getElementById("text");
   const timeEl = document.getElementById("time");
@@ -12,68 +12,73 @@ async function addTask() {
 
   await fs.addDoc(fs.collection(db, "tasks"), {
     text: textEl.value,
-    time: timeEl.value
+    time: timeEl.value   // 存的是 "2025-04-10T14:30" 這種本地格式字串
   });
 
   textEl.value = "";
-  setDefaultTime(); // 新增後重設為現在
+  setDefaultTime();     // 新增後重設為現在
   load();
 }
 
-/* ---------- 讀取 ---------- */
+// ---------- 讀取 ----------
 async function load() {
   const snap = await fs.getDocs(fs.collection(db, "tasks"));
   tasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
   render();
 }
 
-/* ---------- 畫面 ---------- */
+// ---------- 畫面 ----------
 function render() {
   const list = document.getElementById("list");
   list.innerHTML = "";
 
   tasks.forEach(t => {
     const li = document.createElement("li");
+    // 將存的 ISO-like 字串轉成可讀的本地時間格式
+    const displayTime = new Date(t.time).toLocaleString();
+
     li.innerHTML = `
-      ${t.text} (${new Date(t.time).toLocaleString()})
+      ${t.text} (${displayTime})
       <button class="edit">編輯</button>
       <button class="del">刪除</button>
     `;
 
     li.querySelector(".edit").addEventListener("click", () => editTask(t.id, t.text));
     li.querySelector(".del").addEventListener("click", () => delTask(t.id));
-
     list.appendChild(li);
   });
 }
 
-/* ---------- 刪除 ---------- */
+// ---------- 刪除 ----------
 async function delTask(id) {
   await fs.deleteDoc(fs.doc(db, "tasks", id));
   load();
 }
 
-/* ---------- 編輯 ---------- */
+// ---------- 編輯 ----------
 async function editTask(id, oldText) {
-  const t = prompt("修改事項", oldText);
-  if (!t) return;
-  await fs.updateDoc(fs.doc(db, "tasks", id), { text: t });
+  const newText = prompt("修改事項", oldText);
+  if (!newText) return;
+
+  await fs.updateDoc(fs.doc(db, "tasks", id), { text: newText });
   load();
 }
 
-/* ---------- 預設時間（唯一使用 now 的地方） ---------- */
+// ---------- 預設時間（修正時區，讓 <input type="datetime-local"> 顯示本地時間） ----------
 function setDefaultTime() {
   const timeEl = document.getElementById("time");
   const now = new Date();
 
-  // 修正時區
+  // 關鍵修正：把分鐘加上時區偏移，得到本地時間的 ISO 字串前半段
   now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+
+  // 產生 yyyy-MM-ddThh:mm 格式（datetime-local 需要的格式）
   timeEl.value = now.toISOString().slice(0, 16);
 }
 
-/* ---------- DOM Ready ---------- */
+// ---------- DOM Ready ----------
 document.addEventListener("DOMContentLoaded", () => {
-  setDefaultTime(); // 一進頁面就設今天
+  setDefaultTime();                    // 頁面載入時設為現在
   document.getElementById("addBtn").addEventListener("click", addTask);
-  load();
+  load();                              // 載入資料
 });
