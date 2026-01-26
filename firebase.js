@@ -1,4 +1,4 @@
-// firebase.js
+// firebase.js（瀏覽器 CDN 版，GitHub Pages 專用）
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
 import {
   getFirestore,
@@ -22,7 +22,7 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
-// 🔥 關鍵：掛到 window，讓 app.js 用得到
+// 🔥 關鍵：讓 app.js 能用
 window.db = db;
 window.fs = {
   collection,
