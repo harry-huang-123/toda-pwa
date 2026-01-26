@@ -60,9 +60,18 @@ async function editTask(id, oldText) {
   await fs.updateDoc(fs.doc(db, "tasks", id), { text: t });
   load();
 }
+now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
 
 /* ---------- DOM Ready ---------- */
 document.addEventListener("DOMContentLoaded", () => {
+  // 🔥 預設時間 = 現在
+  const timeEl = document.getElementById("time");
+  const now = new Date();
+  now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+  timeEl.value = now.toISOString().slice(0, 16);
+
   document.getElementById("addBtn").addEventListener("click", addTask);
   load();
 });
+
+
