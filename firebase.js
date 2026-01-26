@@ -11,10 +11,10 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyDxdU_EWbzW5QFrxmpWyR7eSBGupVgxzU",
+  apiKey: "AIzaSyDxud_UEWbzW5QFrxmpWyR7eSBGupVgxzU",
   authDomain: "todo-reminder-1f382.firebaseapp.com",
   projectId: "todo-reminder-1f382",
-  storageBucket: "todo-reminder-1f382.appspot.com",
+  storageBucket: "todo-reminder-1f382.appspot.com", // ✅ 修正
   messagingSenderId: "267299790273",
   appId: "1:267299790273:web:822c2b0e6f4ab6c0c06340"
 };
@@ -22,7 +22,7 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
-// 🔥 關鍵：讓 app.js 能用
+// 🔥 讓 app.js 使用
 window.db = db;
 window.fs = {
   collection,
