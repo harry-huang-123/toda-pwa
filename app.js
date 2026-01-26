@@ -34,20 +34,24 @@ function render() {
 
   tasks.forEach(t => {
     const li = document.createElement("li");
-    // 將存的 ISO-like 字串轉成可讀的本地時間格式
-    const displayTime = new Date(t.time).toLocaleString();
+    li.className = "task-card";
 
     li.innerHTML = `
-      ${t.text} (${displayTime})
-      <button class="edit">編輯</button>
-      <button class="del">刪除</button>
+      <div class="task-text">${t.text}</div>
+      <div class="task-time">${new Date(t.time).toLocaleString()}</div>
+      <div class="task-actions">
+        <button class="edit">編輯</button>
+        <button class="del">刪除</button>
+      </div>
     `;
 
     li.querySelector(".edit").addEventListener("click", () => editTask(t.id, t.text));
     li.querySelector(".del").addEventListener("click", () => delTask(t.id));
+
     list.appendChild(li);
   });
 }
+
 
 // ---------- 刪除 ----------
 async function delTask(id) {
@@ -82,3 +86,4 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("addBtn").addEventListener("click", addTask);
   load();                              // 載入資料
 });
+
