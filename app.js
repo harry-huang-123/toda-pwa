@@ -79,3 +79,10 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("addBtn").addEventListener("click", addTask);
   load();
 });
+async function updateCheckStatus() {
+  const snap = await fs.getDocs(fs.collection(db, "tasks"));
+  const status = snap.size > 0 ? "HAS_TASK" : "NO_TASK";
+
+  // 更新 check.html 的狀態（用 redirect 方式）
+  fetch(`check.html?status=${status}`, { cache: "no-store" });
+}
