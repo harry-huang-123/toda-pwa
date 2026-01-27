@@ -1,36 +1,40 @@
+/*************************************************
+ * Firebase CDN（一定要在 app.js 裡）
+ *************************************************/
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
 import {
+  getFirestore,
   collection,
-  getDocs,
   addDoc,
+  getDocs,
   deleteDoc,
   updateDoc,
-  doc,
-  setDoc
+  doc
 } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
 
-import { db } from "./firebase.js";
+/*************************************************
+ * Firebase 設定（⚠️換成你自己的）
+ *************************************************/
+const firebaseConfig = {
+  apiKey: "你的_API_KEY",
+  authDomain: "你的專案.firebaseapp.com",
+  projectId: "你的_projectId",
+  storageBucket: "你的.appspot.com",
+  messagingSenderId: "xxxx",
+  appId: "xxxx"
+};
 
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+/*************************************************
+ * 全域資料
+ *************************************************/
 let tasks = [];
 
-/* ================================
-   🔧 系統狀態同步（給 iOS 捷徑用）
-================================ */
-async function updateTaskStatus() {
-  const status = tasks.length > 0 ? "HAS_TASK" : "NO_TASK";
-  try {
-    await setDoc(doc(db, "system", "status"), {
-      task_status: status,
-      updatedAt: Date.now()
-    });
-    console.log("📡 task_status =", status);
-  } catch (e) {
-    console.error("❌ 更新 system/status 失敗", e);
-  }
-}
-
-/* ================================
-   ➕ 新增任務
-================================ */
+/*************************************************
+ * 新增
+ *************************************************/
 async function addTask() {
   const textEl = document.getElementById("text");
   const timeEl = document.getElementById("time");
@@ -50,27 +54,26 @@ async function addTask() {
   load();
 }
 
-/* ================================
-   📥 讀取任務
-================================ */
+/*************************************************
+ * 讀取
+ *************************************************/
 async function load() {
   const snap = await getDocs(collection(db, "tasks"));
-  tasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  tasks = snap.docs.map(d => ({
+    id: d.id,
+    ...d.data()
+  }));
+
   render();
-  updateTaskStatus(); // ⭐ 關鍵：每次同步狀態
+  updateShortcutStatus(); // ⭐ 給 iOS 捷徑用
 }
 
-/* ================================
-   🖼️ 畫面渲染
-================================ */
+/*************************************************
+ * 畫面
+ *************************************************/
 function render() {
   const list = document.getElementById("list");
   list.innerHTML = "";
-
-  if (tasks.length === 0) {
-    list.innerHTML = `<li class="empty">目前沒有代辦事項</li>`;
-    return;
-  }
 
   tasks.forEach(t => {
     const li = document.createElement("li");
@@ -84,29 +87,25 @@ function render() {
       </div>
     `;
 
-    li.querySelector(".edit").addEventListener("click", () =>
-      editTask(t.id, t.text)
-    );
-    li.querySelector(".del").addEventListener("click", () =>
-      delTask(t.id)
-    );
+    li.querySelector(".edit").onclick = () => editTask(t.id, t.text);
+    li.querySelector(".del").onclick = () => delTask(t.id);
 
     list.appendChild(li);
   });
 }
 
-/* ================================
-   ❌ 刪除任務
-================================ */
+/*************************************************
+ * 刪除
+ *************************************************/
 async function delTask(id) {
   if (!confirm("確定刪除這筆任務？")) return;
   await deleteDoc(doc(db, "tasks", id));
   load();
 }
 
-/* ================================
-   ✏️ 編輯任務
-================================ */
+/*************************************************
+ * 編輯
+ *************************************************/
 async function editTask(id, oldText) {
   const newText = prompt("修改事項", oldText);
   if (!newText) return;
@@ -114,9 +113,9 @@ async function editTask(id, oldText) {
   load();
 }
 
-/* ================================
-   ⏰ 預設時間
-================================ */
+/*************************************************
+ * 預設時間
+ *************************************************/
 function setDefaultTime() {
   const timeEl = document.getElementById("time");
   const now = new Date();
@@ -124,11 +123,22 @@ function setDefaultTime() {
   timeEl.value = now.toISOString().slice(0, 16);
 }
 
-/* ================================
-   🚀 初始化
-================================ */
+/*************************************************
+ * ⭐ 給 iOS 捷徑用的狀態輸出 ⭐
+ * 頁面只會顯示一行文字
+ *************************************************/
+function updateShortcutStatus() {
+  const statusEl = document.getElementById("shortcutStatus");
+  if (!statusEl) return;
+
+  statusEl.textContent = tasks.length > 0 ? "HAS_TASK" : "NO_TASK";
+}
+
+/*************************************************
+ * DOM Ready
+ *************************************************/
 document.addEventListener("DOMContentLoaded", () => {
   setDefaultTime();
-  document.getElementById("addBtn").addEventListener("click", addTask);
+  document.getElementById("addBtn").onclick = addTask;
   load();
 });
