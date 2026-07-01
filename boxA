@@ -1,0 +1,3378 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <time.h>
+#include <cstring>
+
+#if __has_include(<esp_arduino_version.h>)
+#include <esp_arduino_version.h>
+#endif
+
+#ifndef ESP_ARDUINO_VERSION_MAJOR
+#define ESP_ARDUINO_VERSION_MAJOR 2
+#endif
+
+#define BOX_ID "boxA"
+#define HOSTNAME "irrigation-a"
+#define AP_SSID "Setup-boxA"
+#define AP_PASS "12345678"
+
+#define API_KEY "AIzaSyBCdqkWY1J4_QfRmLICnHiJO-EQcKLVjyQ"
+#define DATABASE_URL "https://automatic-irrigation-sys-acc2c-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+// Box B ESP-NOW must use the STA MAC printed by Box B Serial Monitor.
+// Your Box B serial log shows STA MAC: 14:63:93:C1:87:50.
+uint8_t BOX_B_MAC[] = {0x14, 0x63, 0x93, 0xBF, 0x13, 0x4C};  // v15: fixed Box B STA MAC, do not swap A/B boards
+
+// v7 discovery fix:
+// A still uses BOX_B_MAC as the preferred target, but also broadcasts discovery
+// packets until Box B replies. This removes the dependency on typing Box B MAC
+// perfectly and makes channel-hopping Box B easier to lock.
+uint8_t ESP_NOW_BROADCAST_MAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// Do not trust the hard-coded MAC until Box B actually replies.
+// This prevents the common case where Box A code is flashed to the other board
+// and the preferred target becomes Box A itself.
+uint8_t activeBoxBMac[] = {0, 0, 0, 0, 0, 0};
+bool activeBoxBMacLearned = false;
+bool preferredBoxBMacUsable = false;
+
+
+// v12 role isolation: every ESP-NOW packet carries a magic and source/target role.
+// This prevents A commands from being interpreted as B commands and avoids stale cross-zone states.
+#define ESPNOW_PROTOCOL_MAGIC 0x4B495749UL
+#define ESPNOW_PROTOCOL_VERSION 23
+
+
+// ESP-NOW must use the same channel as Box A current radio.
+// When Box A is online, the router decides the channel.
+// When Box A is offline, Setup AP uses ESPNOW_WIFI_CHANNEL as fallback.
+#define ESPNOW_WIFI_CHANNEL 7  // v16: offline Setup AP fallback channel only. Online ESP-NOW follows router WiFi channel.
+#define PREFERRED_ROUTER_CHANNEL 0  // v16: 0 = do not force/prefer any router channel; connect to strongest saved SSID.
+
+const int PIN_VALVE = 0;
+const int PIN_RAIN = 6;
+
+const bool RAIN_SENSOR_ACTIVE_LOW = true;
+const unsigned long HEARTBEAT_INTERVAL_MS = 5000;  // 降低 Firebase 下載量：狀態心跳 5 秒一次
+const unsigned long FAST_COMMAND_INTERVAL_MS = 250;  // 手動控制仍快速，但避免過度讀取 Firebase
+const unsigned long BOXB_TIMEOUT_MS = 90000;  // v12: avoid false offline while ESP-NOW is actually connected
+const unsigned long BOXB_ESPNOW_SEND_INTERVAL_MS = 250UL;  // v9: Box B offline discovery burst every 250 ms; no Firebase traffic.
+const unsigned long RAIN_BLOCK_CONFIRM_MS = 5000;
+// Default only. Runtime value is read from /boxes/boxA/noWaterTimeoutSeconds.
+const unsigned long WATER_CONFIRM_TIMEOUT_MS = 30000;
+const unsigned long SCHEDULE_TRIGGER_WINDOW_MS = 3UL * 60UL * 1000UL;
+const unsigned long SCHEDULE_RETRY_INTERVAL_MS = 10UL * 1000UL;
+const unsigned long POST_WATER_RAIN_IGNORE_MS = 20UL * 60UL * 1000UL;
+const unsigned long NOTIFY_SETTINGS_READ_INTERVAL_MS = 30000;
+const unsigned long SETTINGS_READ_INTERVAL_MS = 10000;  // 排程/設定 10 秒同步一次，手動/儲存時會另外即時刷新
+const unsigned long AP_ACTIVE_TIME_MS = 20UL * 60UL * 1000UL;
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 30000UL;
+const unsigned long AP_CONFIG_HOLD_MS = 5UL * 60UL * 1000UL;  // AP 設定頁使用期間，暫停背景 WiFi 掃描/重連
+const unsigned long WIFI_CONNECT_ATTEMPT1_TIMEOUT_MS = 8000UL;  // v11: 縮短無 WiFi 時等待時間，讓 Setup AP 更快出現
+const unsigned long WIFI_CONNECT_ATTEMPT2_TIMEOUT_MS = 8000UL;  // v11: 第二次連線也不再卡 20 秒以上
+const unsigned long WIFI_SCAN_RESTART_GUARD_MS = 12000UL;       // v11: AP 網頁掃描 WiFi 的重啟保護時間
+const bool BOXA_AUTO_START_AP_WHEN_WIFI_FAIL = true;  // Box A 開機 WiFi 失敗時必須自動開 Setup-boxA AP；AP 與 ESP-NOW 固定同頻，避免互搶。
+
+WebServer server(80);
+bool webServerStarted = false;
+Preferences prefs;
+
+bool wifiOK = false;
+bool espNowReady = false;
+bool apRunning = false;
+unsigned long apStartMillis = 0;
+unsigned long apConfigHoldUntil = 0;
+bool asyncWifiScanRunning = false;
+unsigned long lastAsyncWifiScanStart = 0;
+bool valveState = false;
+
+// One rain sensor dual-use logic.
+// Valve OFF: sensorWet means rain/wet and can block today.
+// Valve ON : sensorWet means water output detected.
+bool sensorWet = false;
+bool rainState = false;
+bool waterDetected = false;
+bool wateringConfirmed = false;
+bool valveFault = false;
+bool rainBlockedToday = false;
+bool wateredToday = false;
+String faultReason = "";
+
+bool manualMode = false;
+bool manualValve = false;
+bool autoMode = true;
+bool scheduleEnabled = false;
+
+int wateringSeconds = 30;
+int noWaterTimeoutSeconds = 30;
+bool useRainStopRule = false;
+String schedule1 = "07:00";
+String schedule2 = "18:00";
+String lastScheduleRun = "";
+unsigned long lastScheduleAttemptMillis = 0;
+String lastDayState = "";
+
+unsigned long valveStartMillis = 0;
+unsigned long rainWetStartMillis = 0;
+unsigned long sensorWetStartMillis = 0;
+unsigned long lastWaterEndMillis = 0;
+unsigned long lastSensorRead = 0;
+unsigned long lastFirebaseSync = 0;
+unsigned long lastSettingsRead = 0;
+unsigned long lastFastCommandRead = 0;
+unsigned long lastBoxBCommandSend = 0;
+unsigned long lastBoxBDebugPrint = 0;
+uint32_t espNowSendOkCount = 0;
+uint32_t espNowSendFailCount = 0;
+uint32_t espNowBroadcastCount = 0;
+uint32_t espNowUnicastCount = 0;
+uint8_t lastEspNowPeerChannel = 0;
+wifi_interface_t lastEspNowPeerIfidx = WIFI_IF_STA;
+uint64_t lastCommandSeqSeen = 0;
+uint64_t lastCommandSeqSeenB = 0;
+unsigned long lastHeapPrint = 0;
+unsigned long lastWiFiReconnect = 0;
+uint32_t heartbeatSeq = 0;
+uint32_t valveActionSeq = 0;
+bool statusDirty = false;
+
+// ===== Box C-style local control state for Box A =====
+bool offlineScheduleContinue = true;
+bool currentWateringFromScheduleA = false;
+String currentScheduleKeyA = "";
+String lastScheduleStartKeyA = "";
+String lastScheduleSkipKeyA = "";
+String manualStoppedScheduleKeyA = "";
+String lastNoWaterFaultKeyA = "";
+unsigned long lastScheduleWatchPrintA = 0;
+unsigned long lastControlLogicA = 0;
+uint64_t lastCommandSeqAckA = 0;
+uint64_t lastCommandSeqAckB = 0;
+String lastValveActionStr = "boot";
+unsigned long lastManualCommandMillisA = 0;
+
+// Box B schedule slot memory in Box A gateway. B has no Firebase/NTP, so A decides schedule timing.
+String lastBoxBScheduleStartKey = "";
+String lastBoxBScheduleSkipKey = "";
+String manualStoppedBoxBScheduleKey = "";
+unsigned long lastScheduleWatchPrintB = 0;
+
+
+// ntfy settings, read from Firebase /settings/notify.
+String ntfyTopic = "kiwi-irrigation-alert";
+bool ntfyEnabled = true;
+bool notifyStartWater = true;
+bool notifyStopWater = true;
+bool notifyWaterConfirmed = true;
+bool notifyNoWaterFault = true;
+bool notifyRainBlocked = true;
+bool notifyOffline = true;
+bool notifyWeatherBlocked = true;
+bool weatherBlockedA = false;
+bool lastWeatherBlockedA = false;
+bool weatherBlockedB = false;
+bool lastWeatherBlockedB = false;
+int weatherRainProbabilityB = 0;
+float weatherPrecipitationMMB = 0.0;
+bool useWeatherRule = true;
+int maxRainProbability = 60;
+float maxPrecipitationMM = 2.0;
+unsigned long lastWeatherFetch = 0;
+const unsigned long WEATHER_FETCH_INTERVAL_MS = 30UL * 60UL * 1000UL;
+unsigned long lastNotifySettingsRead = 0;
+
+bool boxBValve = false;
+bool boxBOnline = false;
+bool boxBLocalMode = false;
+bool boxBLocalAPActive = false;
+bool boxBRainState = false;
+bool boxBSensorWet = false;
+bool boxBWaterDetected = false;
+bool boxBWateringConfirmed = false;
+bool boxBValveFault = false;
+bool boxBRainBlockedToday = false;
+bool boxBWateredToday = false;
+bool boxBWeatherBlocked = false;
+int boxBRemain = 0;
+int boxBScheduleRemainSeconds = 0;
+int boxBNoWaterTimeoutRemainSeconds = 0;
+uint32_t boxBHeartbeatSeq = 0;
+uint32_t boxBValveActionSeq = 0;
+uint32_t lastBoxBValveActionSeq = 0;
+unsigned long lastBoxBSeen = 0;
+bool boxBOfflineNotified = false;
+String boxBSchedule1 = "07:00";
+String boxBSchedule2 = "18:00";
+String lastBoxBScheduleRun = "";
+unsigned long lastBoxBScheduleAttemptMillis = 0;
+
+// Box B schedule safety settings forwarded from Firebase to Box B via ESP-NOW.
+int boxBNoWaterTimeoutSeconds = 30;
+bool boxBUseRainStopRule = false;
+bool boxBOfflineScheduleContinue = true;
+
+uint32_t cmdBSeq = 0;
+
+typedef struct {
+  bool rain;
+  bool manualMode;
+  bool manualValve;
+  bool autoMode;
+  bool scheduleEnabled;
+  bool startWaterRequest;
+  bool clearTodayStatus;
+  bool weatherBlocked;
+  int wateringSeconds;
+  int noWaterTimeoutSeconds;
+  bool useRainStopRule;
+  int weatherRainProbability;
+  float weatherPrecipitationMM;
+  uint32_t requestId;
+  uint32_t heartbeatSeq;
+  bool requestLocalAP;
+  bool offlineScheduleBypass;
+  uint32_t magic;
+  uint16_t protocolVersion;
+  char sourceBox[8];
+  char targetBox[8];
+} CommandToB;
+
+typedef struct {
+  bool valve;
+  bool online;
+  bool rain;
+  bool sensorWet;
+  bool waterDetected;
+  bool wateringConfirmed;
+  bool valveFault;
+  bool rainBlockedToday;
+  bool wateredToday;
+  bool weatherBlocked;
+  bool manualMode;
+  bool manualValve;
+  bool autoMode;
+  bool scheduleEnabled;
+  bool localMode;
+  int remain;
+  int scheduleRemainSeconds;
+  int noWaterTimeoutRemainSeconds;
+  int noWaterTimeoutSeconds;
+  bool useRainStopRule;
+  uint32_t heartbeatSeq;
+  uint32_t valveActionSeq;
+  char lastValveAction[24];
+  bool localAPActive;
+  uint32_t magic;
+  uint16_t protocolVersion;
+  char sourceBox[8];
+  char targetBox[8];
+} StatusFromB;
+
+CommandToB cmdB = {
+  false,  // rain
+  false,  // manualMode
+  false,  // manualValve
+  true,   // autoMode
+  false,  // scheduleEnabled
+  false,  // startWaterRequest
+  false,  // clearTodayStatus
+  false,  // weatherBlocked
+  30,     // wateringSeconds
+  30,     // noWaterTimeoutSeconds
+  false,  // useRainStopRule
+  0,      // weatherRainProbability
+  0.0,    // weatherPrecipitationMM
+  0,      // requestId
+  0,      // heartbeatSeq
+  false,  // requestLocalAP
+  false,  // offlineScheduleBypass
+  0,      // magic, filled before sending
+  0,      // protocolVersion, filled before sending
+  "",     // sourceBox, filled before sending
+  ""      // targetBox, filled before sending
+};
+StatusFromB statusB;
+
+int validWateringSeconds(int seconds) {
+  return seconds < 1 ? 1 : seconds;
+}
+
+uint64_t readCommandSeq(JsonVariantConst value) {
+  if (value.is<uint64_t>()) return value.as<uint64_t>();
+  if (value.is<unsigned long>()) return value.as<unsigned long>();
+  if (value.is<long>()) {
+    long v = value.as<long>();
+    return v > 0 ? (uint64_t)v : 0;
+  }
+  if (value.is<double>()) {
+    double v = value.as<double>();
+    return v > 0 ? (uint64_t)v : 0;
+  }
+  if (value.is<const char *>()) {
+    return strtoull(value.as<const char *>(), nullptr, 10);
+  }
+  return 0;
+}
+
+String u64ToString(uint64_t value) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%llu", (unsigned long long)value);
+  return String(buf);
+}
+
+// ===== Function prototypes =====
+void uploadStatus();
+void saveScheduleSettingsToNVS();
+void loadScheduleSettingsFromNVS();
+void markCurrentScheduleWindowHandledA(const String &reason);
+void markCurrentScheduleHandledA(const String &reason);
+String matchedScheduleSlotA();
+String makeScheduleKeyA(const String &slot);
+String matchedScheduleSlotBByGateway();
+String makeScheduleKeyBByGateway(const String &slot);
+void markCurrentScheduleWindowHandledBByGateway(const String &reason);
+bool offlineScheduleBypassBByGateway();
+void controlLogicBByGateway();
+void holdAPConfigWindow(const char *reason);
+bool apConfigHoldActive();
+void refreshBoxASettingsOnce(const char *reason);
+void refreshBoxBSettingsOnce(const char *reason);
+void printSettingsSummaryAB(const char *reason);
+void printScheduleWatchBByGateway();
+void primeCommandSeqsFromFirebase(const char *reason);
+void clearBoxBOneShotCommand(const char *reason);
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void onEspNowReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len);
+void onEspNowSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status);
+#else
+void onEspNowReceive(const uint8_t *mac, const uint8_t *data, int len);
+void onEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status);
+#endif
+bool ensureEspNowPeer(const uint8_t *mac);
+void printMacAddress(const char *label, const uint8_t *mac);
+void prepareCommandBProtocol();
+bool validStatusFromBPacket(const StatusFromB &packet);
+
+String basePath() {
+  String path = "/boxes/";
+  path.concat(BOX_ID);
+  return path;
+}
+
+String pathJoin(String root, const char *child) {
+  root.concat(child);
+  return root;
+}
+
+String ownPath(const char *child) {
+  return pathJoin(basePath(), child);
+}
+
+String boxBPath(const char *child) {
+  String path = "/boxes/boxB";
+  path.concat(child);
+  return path;
+}
+
+String nowString() {
+  struct tm t;
+  if (!getLocalTime(&t)) return "unknown";
+
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+  return String(buf);
+}
+
+String weatherCodeToText(int code) {
+  switch (code) {
+    case 0: return "晴朗";
+    case 1: return "大致晴朗";
+    case 2: return "局部多雲";
+    case 3: return "多雲";
+    case 45: return "霧";
+    case 48: return "霧淞";
+    case 51: return "毛毛雨";
+    case 53: return "中度毛毛雨";
+    case 55: return "強毛毛雨";
+    case 61: return "小雨";
+    case 63: return "中雨";
+    case 65: return "大雨";
+    case 80: return "陣雨";
+    case 81: return "中度陣雨";
+    case 82: return "強陣雨";
+    case 95: return "雷雨";
+    case 96: return "雷雨伴隨小冰雹";
+    case 99: return "雷雨伴隨大冰雹";
+    default: return "未知天氣";
+  }
+}
+
+String todayString() {
+  struct tm t;
+  if (!getLocalTime(&t)) return "unknown";
+
+  char buf[12];
+  strftime(buf, sizeof(buf), "%Y-%m-%d", &t);
+  return String(buf);
+}
+
+String currentHHMM() {
+  struct tm t;
+  if (!getLocalTime(&t)) return "";
+
+  char buf[6];
+  strftime(buf, sizeof(buf), "%H:%M", &t);
+  return String(buf);
+}
+
+
+int hhmmToMinutes(const String &value) {
+  if (value.length() < 5) return -1;
+  int colon = value.indexOf(':');
+  if (colon <= 0) return -1;
+  int h = value.substring(0, colon).toInt();
+  int m = value.substring(colon + 1).toInt();
+  if (h < 0 || h > 23 || m < 0 || m > 59) return -1;
+  return h * 60 + m;
+}
+
+int currentMinutesOfDay() {
+  String nowHM = currentHHMM();
+  return hhmmToMinutes(nowHM);
+}
+
+bool scheduleMinuteInWindow(int nowMin, int targetMin, int windowMin = 3) {
+  if (nowMin < 0 || targetMin < 0) return false;
+  int diff = (nowMin - targetMin + 1440) % 1440;
+  return diff >= 0 && diff <= windowMin;
+}
+
+bool scheduleTimeMatchesNow(const String &targetHHMM) {
+  // Box C-style strict 24-hour schedule matching.
+  // 15:59 only matches 15:59; it will not also match 03:59.
+  int nowMin = currentMinutesOfDay();
+  int targetMin = hhmmToMinutes(targetHHMM);
+  if (nowMin < 0 || targetMin < 0) return false;
+  return scheduleMinuteInWindow(nowMin, targetMin, 3);
+}
+
+unsigned long noWaterTimeoutMsA() {
+  int seconds = noWaterTimeoutSeconds < 1 ? 1 : noWaterTimeoutSeconds;
+  return (unsigned long)seconds * 1000UL;
+}
+
+String htmlEscape(String value) {
+  value.replace("&", "&amp;");
+  value.replace("<", "&lt;");
+  value.replace(">", "&gt;");
+  value.replace("\"", "&quot;");
+  value.replace("'", "&#39;");
+  return value;
+}
+
+String buildNtfyUrl() {
+  String url = "https://ntfy.sh/";
+  url.concat(ntfyTopic);
+  return url;
+}
+
+
+String jsonEscape(String value) {
+  value.replace("\\", "\\\\");
+  value.replace("\"", "\\\"");
+  value.replace("\n", "\\n");
+  value.replace("\r", "");
+  return value;
+}
+
+String firebaseUrl(String path, bool silentWrite = false) {
+  String url = DATABASE_URL;
+  if (!url.endsWith("/")) url.concat("/");
+  if (path.startsWith("/")) path.remove(0, 1);
+  url.concat(path);
+  url.concat(".json");
+  if (silentWrite) url.concat("?print=silent");
+  return url;
+}
+
+bool firebaseRequestRaw(const char *method, String path, String body, String &payload) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  bool isWrite = (strcmp(method, "PUT") == 0 || strcmp(method, "PATCH") == 0 || strcmp(method, "POST") == 0);
+  String url = firebaseUrl(path, isWrite);
+
+  if (!http.begin(client, url)) {
+    Serial.print("Firebase begin failed: ");
+    Serial.println(url);
+    return false;
+  }
+
+  http.setReuse(false);
+  http.addHeader("Content-Type", "application/json");
+
+  int code = -1;
+  if (strcmp(method, "GET") == 0) {
+    code = http.GET();
+  } else if (strcmp(method, "PUT") == 0) {
+    code = http.PUT(body);
+  } else if (strcmp(method, "PATCH") == 0) {
+    code = http.PATCH(body);
+  } else if (strcmp(method, "POST") == 0) {
+    code = http.POST(body);
+  }
+
+  payload = http.getString();
+  http.end();
+  client.stop();
+
+  if (code < 200 || code >= 300) {
+    Serial.print("Firebase ");
+    Serial.print(method);
+    Serial.print(" failed code=");
+    Serial.print(code);
+    Serial.print(" path=");
+    Serial.println(path);
+    if (payload.length() > 0) {
+      Serial.print("payload=");
+      Serial.println(payload);
+    }
+    return false;
+  }
+
+  return true;
+}
+
+bool firebaseGetRaw(String path, String &payload) {
+  String empty = "";
+  return firebaseRequestRaw("GET", path, empty, payload) && payload != "null";
+}
+
+bool firebasePutRaw(String path, String jsonValue) {
+  String payload;
+  return firebaseRequestRaw("PUT", path, jsonValue, payload);
+}
+
+bool firebasePatchRaw(String path, String jsonObject) {
+  String payload;
+  return firebaseRequestRaw("PATCH", path, jsonObject, payload);
+}
+
+bool firebasePostRaw(String path, String jsonObject) {
+  String payload;
+  return firebaseRequestRaw("POST", path, jsonObject, payload);
+}
+
+bool firebasePutBool(String path, bool value) {
+  return firebasePutRaw(path, value ? "true" : "false");
+}
+
+bool firebasePutInt(String path, int value) {
+  return firebasePutRaw(path, String(value));
+}
+
+bool firebasePutFloat(String path, float value) {
+  return firebasePutRaw(path, String(value, 2));
+}
+
+bool firebasePutString(String path, String value) {
+  String jsonValue;
+  jsonValue.reserve(value.length() + 2);
+  jsonValue.concat("\"");
+  jsonValue.concat(jsonEscape(value));
+  jsonValue.concat("\"");
+  return firebasePutRaw(path, jsonValue);
+}
+
+bool firebaseGetBoolFromJson(JsonVariantConst root, const char *key, bool &target) {
+  if (!root[key].is<bool>()) return false;
+  target = root[key].as<bool>();
+  return true;
+}
+
+bool firebaseGetIntFromJson(JsonVariantConst root, const char *key, int &target) {
+  if (!root[key].is<int>()) return false;
+  target = root[key].as<int>();
+  return true;
+}
+
+bool firebaseGetStringFromJson(JsonVariantConst root, const char *key, String &target) {
+  if (!root[key].is<const char *>()) return false;
+  target = root[key].as<const char *>();
+  return true;
+}
+
+bool waitForTimeSync() {
+  Serial.println("Waiting NTP time sync...");
+  struct tm timeinfo;
+  unsigned long start = millis();
+  while (millis() - start < 15000) {
+    if (getLocalTime(&timeinfo)) {
+      Serial.print("NTP time sync SUCCESS: ");
+      Serial.println(nowString());
+      return true;
+    }
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.println("NTP time sync FAILED");
+  return false;
+}
+
+void readWeatherSettingsForBox(const char *boxId, String &locationName, double &latitude, double &longitude,
+                               bool &ruleEnabled, int &rainLimit, float &precipLimit) {
+  String settingPath = "/settings/weather/";
+  settingPath.concat(boxId);
+
+  String payload;
+  if (!firebaseGetRaw(settingPath, payload)) {
+    Serial.print("Weather settings not found for ");
+    Serial.println(boxId);
+    return;
+  }
+
+  DynamicJsonDocument doc(1024);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("Weather settings JSON error: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  if (doc["locationName"].is<const char *>()) locationName = doc["locationName"].as<const char *>();
+  if (doc["latitude"].is<double>()) latitude = doc["latitude"].as<double>();
+  if (doc["longitude"].is<double>()) longitude = doc["longitude"].as<double>();
+  if (doc["useWeatherRule"].is<bool>()) ruleEnabled = doc["useWeatherRule"].as<bool>();
+  if (doc["maxRainProbability"].is<int>()) rainLimit = doc["maxRainProbability"].as<int>();
+  if (doc["maxPrecipitationMM"].is<float>()) precipLimit = doc["maxPrecipitationMM"].as<float>();
+}
+void sendNtfy(const String &title, const String &message, const String &tags = "droplet");
+
+void fetchWeatherForBox(const char *boxId) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  Serial.println();
+  Serial.print("========== Weather Fetch ");
+  Serial.print(boxId);
+  Serial.println(" ==========");
+
+  String locationName = "Custom";
+  double latitude = 22.6273;
+  double longitude = 120.3014;
+  bool ruleEnabled = true;
+  int rainLimit = 60;
+  float precipLimit = 2.0;
+  readWeatherSettingsForBox(boxId, locationName, latitude, longitude, ruleEnabled, rainLimit, precipLimit);
+
+  String url = "http://api.open-meteo.com/v1/forecast?latitude=";
+  url.concat(String(latitude, 6));
+  url.concat("&longitude=");
+  url.concat(String(longitude, 6));
+  url.concat("&daily=precipitation_sum,precipitation_probability_max,weather_code,temperature_2m_max,temperature_2m_min");
+  url.concat("&timezone=Asia%2FTaipei&forecast_days=1");
+
+  HTTPClient http;
+  Serial.print("Weather URL: ");
+  Serial.println(url);
+
+  if (!http.begin(url)) {
+    Serial.println("Weather HTTP begin failed");
+    return;
+  }
+
+  http.setReuse(false);
+  int code = http.GET();
+  Serial.print("Weather HTTP code: ");
+  Serial.println(code);
+
+  if (code != 200) {
+    String errorPayload = http.getString();
+    Serial.print("Weather error payload: ");
+    Serial.println(errorPayload);
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(8192);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("Weather JSON error: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  float precipitationMM = doc["daily"]["precipitation_sum"][0] | 0.0;
+  int rainProbability = doc["daily"]["precipitation_probability_max"][0] | 0;
+  int weatherCode = doc["daily"]["weather_code"][0] | 0;
+  float tempMax = doc["daily"]["temperature_2m_max"][0] | 0.0;
+  float tempMin = doc["daily"]["temperature_2m_min"][0] | 0.0;
+  float temperature = (tempMax + tempMin) / 2.0;
+
+  bool blockWatering = false;
+  if (ruleEnabled) {
+    blockWatering = (rainProbability >= rainLimit || precipitationMM >= precipLimit);
+  }
+
+  String blockReason;
+  if (!ruleEnabled) {
+    blockReason = "此區未啟用天氣預報限制";
+  } else if (blockWatering) {
+    blockReason = "降雨機率或預估雨量超過設定門檻";
+  } else {
+    blockReason = "目前預報條件允許自動澆水";
+  }
+
+  DynamicJsonDocument out(1024);
+  out["location"] = locationName;
+  out["latitude"] = latitude;
+  out["longitude"] = longitude;
+  out["weatherText"] = weatherCodeToText(weatherCode);
+  out["weatherCode"] = weatherCode;
+  out["temperature"] = temperature;
+  out["rainProbability"] = rainProbability;
+  out["precipitationMM"] = precipitationMM;
+  out["blockWatering"] = blockWatering;
+  out["blockReason"] = blockReason;
+  out["updatedAt"] = nowString();
+
+  String weatherJson;
+  serializeJson(out, weatherJson);
+
+  String weatherPath = "/weather/today/";
+  weatherPath.concat(boxId);
+  bool uploadOk = firebasePutRaw(weatherPath, weatherJson);
+
+  String boxWeatherPath = "/boxes/";
+  boxWeatherPath.concat(boxId);
+  boxWeatherPath.concat("/weatherBlocked");
+  firebasePutBool(boxWeatherPath, blockWatering);
+
+  if (strcmp(boxId, "boxA") == 0) {
+    weatherBlockedA = blockWatering;
+    if (weatherBlockedA && !lastWeatherBlockedA && notifyWeatherBlocked) {
+      String msg = "A 區今日天氣預報不適合自動澆水\n降雨機率：";
+      msg.concat(String(rainProbability));
+      msg.concat("%\n預估雨量：");
+      msg.concat(String(precipitationMM, 1));
+      msg.concat(" mm\n時間：");
+      msg.concat(nowString());
+      sendNtfy("🌧️ A 區天氣預報暫停澆水", msg, "cloud_with_rain");
+    }
+    lastWeatherBlockedA = weatherBlockedA;
+  }
+
+  if (strcmp(boxId, "boxB") == 0) {
+    weatherBlockedB = blockWatering;
+    weatherRainProbabilityB = rainProbability;
+    weatherPrecipitationMMB = precipitationMM;
+    if (weatherBlockedB && !lastWeatherBlockedB && notifyWeatherBlocked) {
+      String msg = "B 區今日天氣預報不適合自動澆水\n降雨機率：";
+      msg.concat(String(rainProbability));
+      msg.concat("%\n預估雨量：");
+      msg.concat(String(precipitationMM, 1));
+      msg.concat(" mm\n時間：");
+      msg.concat(nowString());
+      sendNtfy("🌧️ B 區天氣預報暫停澆水", msg, "cloud_with_rain");
+    }
+    lastWeatherBlockedB = weatherBlockedB;
+  }
+
+  Serial.print("Weather updated for ");
+  Serial.print(boxId);
+  Serial.print(" rain=");
+  Serial.print(rainProbability);
+  Serial.print("% precipitation=");
+  Serial.print(precipitationMM);
+  Serial.print("mm block=");
+  Serial.print(blockWatering ? "true" : "false");
+  Serial.print(" upload=");
+  Serial.println(uploadOk ? "success" : "failed");
+}
+void readNotifySettings() {
+  String payload;
+  if (!firebaseGetRaw("/settings/notify", payload)) return;
+
+  StaticJsonDocument<1024> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) return;
+
+  if (doc["enabled"].is<bool>()) ntfyEnabled = doc["enabled"].as<bool>();
+  if (doc["topic"].is<const char *>()) {
+    String t = doc["topic"].as<const char *>();
+    t.trim();
+    if (t.length() > 0) ntfyTopic = t;
+  }
+  if (doc["startWater"].is<bool>()) notifyStartWater = doc["startWater"].as<bool>();
+  if (doc["stopWater"].is<bool>()) notifyStopWater = doc["stopWater"].as<bool>();
+  if (doc["waterConfirmed"].is<bool>()) notifyWaterConfirmed = doc["waterConfirmed"].as<bool>();
+  if (doc["noWaterFault"].is<bool>()) notifyNoWaterFault = doc["noWaterFault"].as<bool>();
+  if (doc["rainBlocked"].is<bool>()) notifyRainBlocked = doc["rainBlocked"].as<bool>();
+  if (doc["offline"].is<bool>()) notifyOffline = doc["offline"].as<bool>();
+  if (doc["weatherBlocked"].is<bool>()) notifyWeatherBlocked = doc["weatherBlocked"].as<bool>();
+}
+void sendNtfy(const String &title, const String &message, const String &tags) {
+  if (!ntfyEnabled) return;
+  if (ntfyTopic.length() == 0) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient https;
+  String url = buildNtfyUrl();
+  if (!https.begin(client, url)) {
+    Serial.println("ntfy begin failed");
+    return;
+  }
+
+  https.addHeader("Content-Type", "text/plain; charset=utf-8");
+  https.addHeader("Title", title);
+  https.addHeader("Tags", tags);
+  https.addHeader("Priority", "default");
+
+  int code = https.POST(message);
+  Serial.print("ntfy code: ");
+  Serial.println(code);
+
+  https.end();
+}
+void pushEventForBox(const String &box, const String &type, const String &message) {
+  StaticJsonDocument<512> json;
+  json["box"] = box;
+  json["type"] = type;
+  json["message"] = message;
+  json["time"] = nowString();
+
+  String body;
+  serializeJson(json, body);
+  firebasePostRaw("/events", body);
+
+  String p = "/boxes/";
+  p.concat(box);
+  p.concat("/lastEvent");
+  firebasePutString(p, message);
+}
+
+void pushEvent(const String &type, const String &message) {
+  pushEventForBox(BOX_ID, type, message);
+}
+
+void updateLastValveAction(const char *action, const String &reason) {
+  lastValveActionStr = action ? String(action) : String("action");
+  valveActionSeq++;
+  firebasePutInt(ownPath("/valveActionSeq"), (int)valveActionSeq);
+  firebasePutString(ownPath("/lastValveAction"), action);
+  firebasePutString(ownPath("/lastValveActionTime"), nowString());
+  firebasePutString(ownPath("/lastWaterReason"), reason);
+}
+void markWaterConfirmed() {
+  if (wateringConfirmed) return;
+
+  waterDetected = true;
+  wateringConfirmed = true;
+  wateredToday = true;
+  valveFault = false;
+  faultReason = "";
+  updateLastValveAction("water_ok", "single sensor confirmed water output");
+
+  firebasePutBool(ownPath("/waterDetected"), true);
+  firebasePutBool(ownPath("/wateringConfirmed"), true);
+  firebasePutBool(ownPath("/wateredToday"), true);
+  firebasePutBool(ownPath("/valveFault"), false);
+  firebasePutString(ownPath("/lastWaterConfirmTime"), nowString());
+
+  pushEvent("water_confirmed", "boxA water output confirmed by rain sensor");
+
+  if (notifyWaterConfirmed) {
+    String msg = "A 區已確認有出水\n時間：";
+    msg.concat(nowString());
+    sendNtfy("✅ A 區出水確認", msg, "white_check_mark");
+  }
+}
+
+void markValveFault(const String &reason) {
+  if (valveFault) return;
+
+  valveFault = true;
+  faultReason = reason;
+  updateLastValveAction("no_water", reason);
+
+  firebasePutBool(ownPath("/valveFault"), true);
+  firebasePutString(ownPath("/faultReason"), reason);
+
+  String eventMsg = "boxA suspected no water output. Reason: ";
+  eventMsg.concat(reason);
+  pushEvent("no_water", eventMsg);
+
+  if (notifyNoWaterFault) {
+    String msg = "A 區電磁閥已開啟，但雨滴感測器沒有偵測到出水\n原因：";
+    msg.concat(reason);
+    msg.concat("\n時間：");
+    msg.concat(nowString());
+    sendNtfy("⚠️ A 區疑似沒有出水", msg, "warning");
+  }
+}
+
+void markRainBlockedToday() {
+  if (rainBlockedToday) return;
+
+  rainBlockedToday = true;
+  updateLastValveAction("rain_blocked", "single sensor wet while valve off");
+
+  firebasePutBool(ownPath("/rainBlockedToday"), true);
+  firebasePutBool(ownPath("/rain"), true);
+
+  pushEvent("rain_blocked", "boxA rain/wet sensor blocked today auto watering");
+
+  if (notifyRainBlocked) {
+    String msg = "A 區雨滴感測器偵測到潮濕，今日自動澆水暫停\n時間：";
+    msg.concat(nowString());
+    sendNtfy("🌧️ A 區今日因雨滴暫停", msg, "cloud_with_rain");
+  }
+}
+
+void clearTodayState() {
+  rainBlockedToday = false;
+  wateredToday = false;
+  wateringConfirmed = false;
+  waterDetected = false;
+  valveFault = false;
+  faultReason = "";
+  rainWetStartMillis = 0;
+  lastScheduleStartKeyA = "";
+  lastScheduleSkipKeyA = "";
+  lastNoWaterFaultKeyA = "";
+  manualStoppedScheduleKeyA = "";
+
+  // Same as Box C: clearing today's pause/fault restores scheduleEnabled,
+  // but if the current time is still inside a schedule window, mark it handled
+  // to avoid doing a missed schedule late.
+  scheduleEnabled = true;
+  markCurrentScheduleWindowHandledA("clear_today_restore_schedule_no_catchup");
+  updateLastValveAction("clear_day", "clear today status");
+
+  firebasePutBool(ownPath("/rainBlockedToday"), false);
+  firebasePutBool(ownPath("/wateredToday"), false);
+  firebasePutBool(ownPath("/wateringConfirmed"), false);
+  firebasePutBool(ownPath("/waterDetected"), false);
+  firebasePutBool(ownPath("/valveFault"), false);
+  firebasePutString(ownPath("/faultReason"), "");
+  firebasePutBool(ownPath("/clearTodayStatus"), false);
+  firebasePutBool(ownPath("/scheduleEnabled"), true);
+
+  pushEvent("clear_day", "boxA clear today status and fault, scheduleEnabled restored");
+}
+
+
+void forceValveImmediate(bool on, const char *reason) {
+  // Highest-priority manual GPIO path: do hardware action first, no Firebase/ntfy/event before GPIO.
+  pinMode(PIN_VALVE, OUTPUT);
+  digitalWrite(PIN_VALVE, on ? HIGH : LOW);
+
+  Serial.print("GPIO");
+  Serial.print(PIN_VALVE);
+  Serial.print(" IMMEDIATE ");
+  Serial.print(on ? "HIGH" : "LOW");
+  Serial.print(" reason=");
+  Serial.print(reason ? reason : "");
+  Serial.print(" readback=");
+  Serial.println(digitalRead(PIN_VALVE));
+
+  if (valveState != on) {
+    valveState = on;
+    valveActionSeq++;
+    if (on) {
+      valveStartMillis = millis();
+      waterDetected = false;
+      wateringConfirmed = false;
+      valveFault = false;
+      faultReason = "";
+    } else {
+      lastWaterEndMillis = millis();
+    }
+  }
+
+  statusDirty = true;
+}
+
+void setValve(bool on, String reason = "") {
+  // Always force GPIO4 to the requested level, even if the software state already says ON/OFF.
+  // This makes hardware testing reliable after reset or after a missed command.
+  pinMode(PIN_VALVE, OUTPUT);
+  digitalWrite(PIN_VALVE, on ? HIGH : LOW);
+
+  Serial.print("GPIO");
+  Serial.print(PIN_VALVE);
+  Serial.print(" forced ");
+  Serial.print(on ? "HIGH" : "LOW");
+  Serial.print(" reason=");
+  Serial.print(reason);
+  Serial.print(" readback=");
+  Serial.println(digitalRead(PIN_VALVE));
+
+  if (valveState == on) {
+    firebasePutBool(ownPath("/valve"), on);
+    firebasePutString(ownPath("/lastGPIOLevel"), on ? "HIGH" : "LOW");
+    return;
+  }
+
+  valveState = on;
+  firebasePutBool(ownPath("/valve"), valveState);
+  firebasePutString(ownPath("/lastGPIOLevel"), on ? "HIGH" : "LOW");
+
+  if (on) {
+    valveStartMillis = millis();
+    waterDetected = false;
+    wateringConfirmed = false;
+    valveFault = false;
+    faultReason = "";
+    updateLastValveAction("valve_on", reason);
+
+    firebasePutString(ownPath("/lastWaterTime"), nowString());
+    firebasePutString(ownPath("/lastWaterReason"), reason);
+    firebasePutBool(ownPath("/waterDetected"), false);
+    firebasePutBool(ownPath("/wateringConfirmed"), false);
+    firebasePutBool(ownPath("/valveFault"), false);
+    firebasePutString(ownPath("/faultReason"), "");
+
+    String msg = "boxA start watering. Reason: ";
+    msg.concat(reason);
+    pushEvent("water_start", msg);
+
+    if (notifyStartWater) {
+      String body = "原因：";
+      body.concat(reason);
+      body.concat("\n時間：");
+      body.concat(nowString());
+      sendNtfy("🚿 A 區開始澆水", body, "droplet");
+    }
+  } else {
+    lastWaterEndMillis = millis();
+    updateLastValveAction("valve_off", reason);
+
+    String msg = "boxA stop watering. Reason: ";
+    msg.concat(reason);
+    pushEvent("water_stop", msg);
+
+    if (notifyStopWater) {
+      String body = "原因：";
+      body.concat(reason);
+      body.concat("\n時間：");
+      body.concat(nowString());
+      sendNtfy("✅ A 區停止澆水", body, "white_check_mark");
+    }
+  }
+}
+
+void saveWiFi(String ssid, String pass) {
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+}
+
+bool loadWiFi(String &ssid, String &pass) {
+  prefs.begin("wifi", true);
+  ssid = prefs.getString("ssid", "");
+  pass = prefs.getString("pass", "");
+  prefs.end();
+  return ssid.length() > 0;
+}
+
+void saveScheduleSettingsToNVS() {
+  prefs.begin("schedAB", false);
+  // Box A local schedule/settings cache
+  prefs.putBool("aEnabled", scheduleEnabled);
+  prefs.putString("aS1", schedule1);
+  prefs.putString("aS2", schedule2);
+  prefs.putInt("aWaterSec", wateringSeconds);
+  prefs.putInt("aTimeout", noWaterTimeoutSeconds);
+  prefs.putBool("aRainRule", useRainStopRule);
+  prefs.putBool("aWeatherRule", useWeatherRule);
+  prefs.putBool("aOffline", offlineScheduleContinue);
+
+  // Box B schedule/settings cache stored in Box A gateway.
+  // Box B has no Firebase/NTP; Box A decides B schedule and sends ESP-NOW.
+  prefs.putBool("bEnabled", cmdB.scheduleEnabled);
+  prefs.putString("bS1", boxBSchedule1);
+  prefs.putString("bS2", boxBSchedule2);
+  prefs.putInt("bWaterSec", cmdB.wateringSeconds);
+  prefs.putInt("bTimeout", boxBNoWaterTimeoutSeconds);
+  prefs.putBool("bRainRule", boxBUseRainStopRule);
+  prefs.putBool("bOffline", boxBOfflineScheduleContinue);
+  prefs.end();
+}
+
+void loadScheduleSettingsFromNVS() {
+  prefs.begin("schedAB", true);
+  scheduleEnabled = prefs.getBool("aEnabled", scheduleEnabled);
+  schedule1 = prefs.getString("aS1", schedule1);
+  schedule2 = prefs.getString("aS2", schedule2);
+  wateringSeconds = validWateringSeconds(prefs.getInt("aWaterSec", wateringSeconds));
+  noWaterTimeoutSeconds = validWateringSeconds(prefs.getInt("aTimeout", noWaterTimeoutSeconds));
+  useRainStopRule = prefs.getBool("aRainRule", useRainStopRule);
+  useWeatherRule = prefs.getBool("aWeatherRule", useWeatherRule);
+  offlineScheduleContinue = prefs.getBool("aOffline", offlineScheduleContinue);
+
+  cmdB.scheduleEnabled = prefs.getBool("bEnabled", cmdB.scheduleEnabled);
+  boxBSchedule1 = prefs.getString("bS1", boxBSchedule1);
+  boxBSchedule2 = prefs.getString("bS2", boxBSchedule2);
+  cmdB.wateringSeconds = validWateringSeconds(prefs.getInt("bWaterSec", cmdB.wateringSeconds));
+  boxBNoWaterTimeoutSeconds = validWateringSeconds(prefs.getInt("bTimeout", boxBNoWaterTimeoutSeconds));
+  cmdB.noWaterTimeoutSeconds = boxBNoWaterTimeoutSeconds;
+  boxBUseRainStopRule = prefs.getBool("bRainRule", boxBUseRainStopRule);
+  cmdB.useRainStopRule = boxBUseRainStopRule;
+  boxBOfflineScheduleContinue = prefs.getBool("bOffline", boxBOfflineScheduleContinue);
+  prefs.end();
+
+  Serial.print("Loaded AB schedule backup: A enabled=");
+  Serial.print(scheduleEnabled);
+  Serial.print(" A schedule=");
+  Serial.print(schedule1);
+  Serial.print("/");
+  Serial.print(schedule2);
+  Serial.print(" B enabled=");
+  Serial.print(cmdB.scheduleEnabled);
+  Serial.print(" B schedule=");
+  Serial.print(boxBSchedule1);
+  Serial.print("/");
+  Serial.print(boxBSchedule2);
+  Serial.print(" offlineA=");
+  Serial.print(offlineScheduleContinue);
+  Serial.print(" offlineB=");
+  Serial.println(boxBOfflineScheduleContinue);
+}
+
+bool connectWiFi() {
+  String ssid, pass;
+  if (!loadWiFi(ssid, pass)) {
+    Serial.println("No saved WiFi. Box A will start Setup-boxA AP for setup.");
+    return false;
+  }
+
+  ssid.trim();
+  Serial.println("========== WiFi Connect boxA ==========");
+  Serial.print("Target SSID: ");
+  Serial.println(ssid);
+
+  // Important fix:
+  // When Setup-boxA AP is running on ESP-NOW channel 7, connecting to a router on another
+  // channel can fail in AP+STA mode. Stop SoftAP first, connect as STA only, then restart
+  // AP only if connection fails. This avoids the repeated status=6 failure seen in Serial.
+  if (apRunning) {
+    Serial.println("Temporarily stop Setup-boxA AP before router WiFi connect.");
+    WiFi.softAPdisconnect(true);
+    apRunning = false;
+    delay(500);
+  }
+
+  if (espNowReady) {
+    Serial.println("Temporarily stop ESP-NOW before router WiFi connect.");
+    esp_now_deinit();
+    espNowReady = false;
+    delay(100);
+  }
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setHostname(HOSTNAME);
+  WiFi.disconnect(false, false);  // keep saved credentials in Preferences; only disconnect radio session
+  delay(600);
+
+  Serial.print("Scanning WiFi before connect: ");
+  Serial.println(ssid);
+
+  int n = WiFi.scanNetworks(false, true);
+  int bestIndex = -1;
+  int bestRSSI = -999;
+  int bestChannel = 0;
+  bool bestIsPreferredChannel = false;  // v16: stays false when PREFERRED_ROUTER_CHANNEL=0
+  uint8_t bestBSSID[6] = {0};
+
+  Serial.print("Found networks: ");
+  Serial.println(n);
+  for (int i = 0; i < n; i++) {
+    Serial.print(i);
+    Serial.print(": SSID: ");
+    Serial.print(WiFi.SSID(i));
+    Serial.print(" | RSSI: ");
+    Serial.print(WiFi.RSSI(i));
+    Serial.print(" | CH: ");
+    Serial.print(WiFi.channel(i));
+    Serial.print(" | BSSID: ");
+    Serial.println(WiFi.BSSIDstr(i));
+
+    if (WiFi.SSID(i) == ssid && WiFi.RSSI(i) > bestRSSI) {
+      // v16: Do not force CH7/CH11 here. Connect to the strongest matching SSID.
+      // ESP-NOW will use the router's actual channel after connection, and Box B will search for it while offline.
+      bestIndex = i;
+      bestRSSI = WiFi.RSSI(i);
+      bestChannel = WiFi.channel(i);
+      bestIsPreferredChannel = false;
+      memcpy(bestBSSID, WiFi.BSSID(i), 6);
+    }
+  }
+
+  if (bestIndex < 0) {
+    Serial.println("Target WiFi not found. Box A will start/keep Setup-boxA AP for setup.");
+    WiFi.scanDelete();
+    return false;
+  }
+
+  Serial.print("Best AP channel=");
+  Serial.print(bestChannel);
+  Serial.print(" RSSI=");
+  Serial.print(bestRSSI);
+  Serial.print(" BSSID=");
+  Serial.println(WiFi.BSSIDstr(bestIndex));
+
+  Serial.println("WiFi attempt 1: connect with fixed channel+BSSID");
+  WiFi.begin(ssid.c_str(), pass.c_str(), bestChannel, bestBSSID, true);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_ATTEMPT1_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.print("Attempt 1 failed status=");
+    Serial.println(WiFi.status());
+    Serial.println("WiFi attempt 2: connect by SSID only, let ESP32 choose BSSID/channel");
+
+    WiFi.disconnect(false, false);
+    delay(800);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+
+    start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_ATTEMPT2_TIMEOUT_MS) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println();
+  }
+
+  int finalStatus = WiFi.status();
+  WiFi.scanDelete();
+
+  if (finalStatus == WL_CONNECTED) {
+    Serial.println("WiFi connected SUCCESS");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("RSSI: ");
+    Serial.println(WiFi.RSSI());
+    Serial.print("Channel: ");
+    Serial.println(WiFi.channel());
+    Serial.print("MAC: ");
+    Serial.println(WiFi.macAddress());
+    return true;
+  }
+
+  Serial.print("WiFi connected FAILED status=");
+  Serial.println(finalStatus);
+  Serial.println("Most common causes: wrong password, router rejects ESP32, or 2.4 GHz security/channel setting issue.");
+  return false;
+}
+
+void startAPMode() {
+  // Box A local AP.
+  // If STA is connected, SoftAP must use the same channel as the router.
+  // If STA is not connected, use the same fixed channel as Box B ESP-NOW.
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setHostname(HOSTNAME);
+  esp_wifi_set_max_tx_power(78); // 19.5 dBm, stronger local AP signal.
+  delay(150);
+
+  int apChannel = ESPNOW_WIFI_CHANNEL;
+  if (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) {
+    apChannel = WiFi.channel();
+  }
+
+  // Restart SoftAP every time this is requested. This avoids the AP staying on an old
+  // channel after WiFi reconnects or after ESP-NOW changes channel.
+  WiFi.softAPdisconnect(true);
+  delay(300);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+
+  bool ok = false;
+  for (int attempt = 1; attempt <= 3 && !ok; attempt++) {
+    ok = WiFi.softAP(AP_SSID, AP_PASS, apChannel, 0, 8);
+    delay(400);
+    Serial.print("AP attempt ");
+    Serial.print(attempt);
+    Serial.print(" result: ");
+    Serial.println(ok ? "OK" : "FAILED");
+  }
+
+  // Keep radio on the AP/ESP-NOW channel when Box A is offline.
+  // This makes Setup-boxA visible and keeps Box B reachable.
+  if (WiFi.status() != WL_CONNECTED) {
+    esp_wifi_set_channel(apChannel, WIFI_SECOND_CHAN_NONE);
+  }
+
+  apRunning = ok;
+  if (ok) {
+    apStartMillis = millis();
+    holdAPConfigWindow("ap_start");
+  }
+
+  Serial.println("========== Local AP Start boxA ==========");
+  Serial.print("AP result: ");
+  Serial.println(ok ? "OK" : "FAILED");
+  Serial.print("AP SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("AP PASS: ");
+  Serial.println(AP_PASS);
+  Serial.print("AP channel: ");
+  Serial.println(apChannel);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("AP MAC: ");
+  Serial.println(WiFi.softAPmacAddress());
+  Serial.println("Open http://192.168.4.1 . If WiFi is not connected, AP will stay active for setup.");
+
+  // v15: SoftAP shares the same radio. After AP starts, refresh ESP-NOW peers on the current channel.
+  if (espNowReady) {
+    lastEspNowPeerChannel = 0;
+    lastEspNowPeerIfidx = WIFI_IF_STA;
+    ensureEspNowPeer(activeBoxBMac);
+    ensureEspNowPeer(ESP_NOW_BROADCAST_MAC);
+  }
+}
+
+void stopAPMode() {
+  if (!apRunning) return;
+  WiFi.softAPdisconnect(true);
+  apRunning = false;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.mode(WIFI_STA);
+  } else {
+    WiFi.mode(WIFI_STA);
+  }
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  Serial.println("AP stopped after 20 minutes.");
+}
+
+void initFirebase() {
+  Serial.println("========== Firebase REST Init boxA ==========");
+  firebasePutBool(ownPath("/online"), true);
+  firebasePutString(ownPath("/ip"), WiFi.localIP().toString());
+  firebasePutInt(ownPath("/rssi"), WiFi.RSSI());
+  firebasePutString(ownPath("/lastUpdate"), nowString());
+  Serial.println("Firebase REST init done");
+}
+
+void printMacAddress(const char *label, const uint8_t *mac) {
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  if (label && strlen(label) > 0) {
+    Serial.print(label);
+    Serial.print(": ");
+  }
+  Serial.println(buf);
+}
+
+void getOwnStaMac(uint8_t *mac) {
+  if (!mac) return;
+  esp_wifi_get_mac(WIFI_IF_STA, mac);
+}
+
+bool macEquals(const uint8_t *a, const uint8_t *b) {
+  if (!a || !b) return false;
+  return memcmp(a, b, 6) == 0;
+}
+
+bool macIsZero(const uint8_t *mac) {
+  if (!mac) return true;
+  for (int i = 0; i < 6; i++) {
+    if (mac[i] != 0) return false;
+  }
+  return true;
+}
+
+bool macIsBroadcast(const uint8_t *mac) {
+  if (!mac) return false;
+  for (int i = 0; i < 6; i++) {
+    if (mac[i] != 0xFF) return false;
+  }
+  return true;
+}
+
+
+uint8_t currentRadioChannelA() {
+  uint8_t ch = 0;
+  wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+  if (esp_wifi_get_channel(&ch, &second) == ESP_OK && ch >= 1 && ch <= 13) return ch;
+  if (WiFi.status() == WL_CONNECTED && WiFi.channel() >= 1 && WiFi.channel() <= 13) return (uint8_t)WiFi.channel();
+  return ESPNOW_WIFI_CHANNEL;
+}
+
+wifi_interface_t currentEspNowIfidxA() {
+  // v20 critical fix:
+  // When Box A is only running Setup-boxA AP and is not connected to router WiFi,
+  // ESP-NOW must use the AP interface. Using WIFI_IF_STA here can make A transmit fail
+  // while the phone can still connect to Setup-boxA.
+  if (apRunning && WiFi.status() != WL_CONNECTED) return WIFI_IF_AP;
+  return WIFI_IF_STA;
+}
+
+bool ensureEspNowPeer(const uint8_t *mac) {
+  if (!mac) return false;
+
+  uint8_t ch = currentRadioChannelA();
+  wifi_interface_t ifidx = currentEspNowIfidxA();
+
+  // If the router/AP channel or interface changes, the old peer becomes stale.
+  // Recreate peers when channel OR ifidx changes.
+  if (esp_now_is_peer_exist(mac)) {
+    if (lastEspNowPeerChannel == ch && lastEspNowPeerIfidx == ifidx) return true;
+    esp_now_del_peer(mac);
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = ch;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = ifidx;
+
+  esp_err_t result = esp_now_add_peer(&peerInfo);
+  Serial.print("ESP-NOW add peer currentCh=");
+  Serial.print(ch);
+  Serial.print(" ifidx=");
+  Serial.print(ifidx == WIFI_IF_AP ? "AP" : "STA");
+  Serial.print(" mac=");
+  printMacAddress("", mac);
+  Serial.print(" result=");
+  Serial.println(result == ESP_OK ? "OK" : String((int)result));
+
+  if (result == ESP_OK || result == ESP_ERR_ESPNOW_EXIST) {
+    lastEspNowPeerChannel = ch;
+    lastEspNowPeerIfidx = ifidx;
+    return true;
+  }
+  return false;
+}
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void onEspNowSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  (void)tx_info;
+  if (status == ESP_NOW_SEND_SUCCESS) espNowSendOkCount++;
+  else espNowSendFailCount++;
+}
+#else
+void onEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  (void)mac_addr;
+  if (status == ESP_NOW_SEND_SUCCESS) espNowSendOkCount++;
+  else espNowSendFailCount++;
+}
+#endif
+
+void notifyBoxBAction(const char *action) {
+  String msg = "B 區回傳動作：";
+  msg.concat(action);
+  msg.concat("\n時間：");
+  msg.concat(nowString());
+
+  if ((strcmp(action, "valve_on") == 0 || strcmp(action, "on") == 0) && notifyStartWater) {
+    sendNtfy("🚿 B 區開始澆水", msg, "droplet");
+  } else if ((strcmp(action, "valve_off") == 0 || strcmp(action, "off") == 0) && notifyStopWater) {
+    sendNtfy("✅ B 區停止澆水", msg, "white_check_mark");
+  } else if (strcmp(action, "water_ok") == 0 && notifyWaterConfirmed) {
+    sendNtfy("✅ B 區出水確認", msg, "white_check_mark");
+  } else if (strcmp(action, "no_water") == 0 && notifyNoWaterFault) {
+    sendNtfy("⚠️ B 區疑似沒有出水", msg, "warning");
+  } else if ((strcmp(action, "rain_blocked") == 0 || strcmp(action, "rain_stop") == 0) && notifyRainBlocked) {
+    sendNtfy("🌧️ B 區今日因雨滴暫停", msg, "cloud_with_rain");
+  }
+}
+
+void handleEspNowReceive(const uint8_t *srcAddr, const uint8_t *data, int len) {
+  if (len == sizeof(StatusFromB)) {
+    uint8_t ownMac[6] = {0};
+    getOwnStaMac(ownMac);
+    if (macEquals(srcAddr, ownMac)) {
+      Serial.println("Ignore ESP-NOW status from own STA MAC");
+      return;
+    }
+
+    bool wasBoxBOnline = boxBOnline;
+
+    // Learn actual Box B STA MAC from the response. This is more reliable than
+    // a hard-coded MAC and fixes the common AP-MAC/STA-MAC off-by-one issue.
+    if (memcmp(activeBoxBMac, srcAddr, 6) != 0) {
+      memcpy(activeBoxBMac, srcAddr, 6);
+      activeBoxBMacLearned = true;
+      ensureEspNowPeer(activeBoxBMac);
+      printMacAddress("BOX B MAC learned", activeBoxBMac);
+    } else {
+      activeBoxBMacLearned = true;
+    }
+
+    memcpy(&statusB, data, sizeof(statusB));
+    if (!validStatusFromBPacket(statusB)) {
+      Serial.print("Ignore ESP-NOW status with wrong role/magic from ");
+      printMacAddress("", srcAddr);
+      return;
+    }
+    boxBValve = statusB.valve;
+    boxBOnline = true;
+    boxBRainState = statusB.rain;
+    boxBSensorWet = statusB.sensorWet;
+    boxBWaterDetected = statusB.waterDetected;
+    boxBWateringConfirmed = statusB.wateringConfirmed;
+    boxBValveFault = statusB.valveFault;
+    boxBRainBlockedToday = statusB.rainBlockedToday;
+    boxBWateredToday = statusB.wateredToday;
+    boxBWeatherBlocked = statusB.weatherBlocked;
+    boxBLocalMode = statusB.localMode;
+    boxBLocalAPActive = statusB.localAPActive;
+    boxBRemain = statusB.remain;
+    boxBScheduleRemainSeconds = statusB.scheduleRemainSeconds;
+    boxBNoWaterTimeoutRemainSeconds = statusB.noWaterTimeoutRemainSeconds;
+    // 不要讓 Box B 回傳的舊設定覆蓋 Gateway 從 Firebase 讀到的新設定。
+    // Box B 只負責回報即時狀態；noWaterTimeoutSeconds / useRainStopRule 以 Firebase -> Box A Gateway 為準。
+    boxBHeartbeatSeq = statusB.heartbeatSeq;
+    boxBValveActionSeq = statusB.valveActionSeq;
+    lastBoxBSeen = millis();
+    boxBOfflineNotified = false;
+    if (!wasBoxBOnline) {
+      char macText[18];
+      snprintf(macText, sizeof(macText), "%02X:%02X:%02X:%02X:%02X:%02X",
+               srcAddr[0], srcAddr[1], srcAddr[2], srcAddr[3], srcAddr[4], srcAddr[5]);
+      Serial.print("BOX B ONLINE via ESP-NOW from ");
+      Serial.println(macText);
+    }
+
+    if (lastBoxBValveActionSeq != 0 && boxBValveActionSeq != lastBoxBValveActionSeq) {
+      notifyBoxBAction(statusB.lastValveAction);
+      pushEventForBox("boxB", "espnow_action", statusB.lastValveAction);
+
+      firebasePutString(boxBPath("/lastValveAction"), statusB.lastValveAction);
+      firebasePutString(boxBPath("/lastValveActionTime"), nowString());
+    }
+    lastBoxBValveActionSeq = boxBValveActionSeq;
+  } else {
+    Serial.print("Unexpected Box B packet size: ");
+    Serial.println(len);
+  }
+}
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void onEspNowReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (!info || !data) return;
+  handleEspNowReceive(info->src_addr, data, len);
+}
+#else
+void onEspNowReceive(const uint8_t *mac, const uint8_t *data, int len) {
+  if (!mac || !data) return;
+  handleEspNowReceive(mac, data, len);
+}
+#endif
+
+
+void prepareCommandBProtocol() {
+  cmdB.magic = ESPNOW_PROTOCOL_MAGIC;
+  cmdB.protocolVersion = ESPNOW_PROTOCOL_VERSION;
+  memset(cmdB.sourceBox, 0, sizeof(cmdB.sourceBox));
+  memset(cmdB.targetBox, 0, sizeof(cmdB.targetBox));
+  strncpy(cmdB.sourceBox, "boxA", sizeof(cmdB.sourceBox) - 1);
+  strncpy(cmdB.targetBox, "boxB", sizeof(cmdB.targetBox) - 1);
+}
+
+bool validStatusFromBPacket(const StatusFromB &packet) {
+  if (packet.magic != ESPNOW_PROTOCOL_MAGIC) return false;
+  if (strncmp(packet.sourceBox, "boxB", sizeof(packet.sourceBox)) != 0) return false;
+  if (strncmp(packet.targetBox, "boxA", sizeof(packet.targetBox)) != 0) return false;
+  return true;
+}
+
+void initEspNow() {
+  if (espNowReady) return;
+
+  WiFi.setSleep(false);
+  esp_err_t initResult = esp_now_init();
+  if (initResult != ESP_OK) {
+    Serial.print("ESP-NOW init failed code=");
+    Serial.println((int)initResult);
+    return;
+  }
+
+  esp_now_register_recv_cb(onEspNowReceive);
+  esp_now_register_send_cb(onEspNowSent);
+
+  uint8_t ownMac[6] = {0};
+  getOwnStaMac(ownMac);
+  printMacAddress("ESP-NOW own STA MAC", ownMac);
+
+  memset(activeBoxBMac, 0, 6);
+  activeBoxBMacLearned = false;
+  preferredBoxBMacUsable = (!macIsZero(BOX_B_MAC) && !macEquals(BOX_B_MAC, ownMac));
+
+  if (preferredBoxBMacUsable) {
+    memcpy(activeBoxBMac, BOX_B_MAC, 6);
+    // Do not mark this as learned yet. A hard-coded MAC may be stale after boards
+    // are swapped or reflashed. It becomes learned only after Box B really replies.
+    activeBoxBMacLearned = false;
+    ensureEspNowPeer(activeBoxBMac);
+    printMacAddress("ESP-NOW preferred Box B", activeBoxBMac);
+  } else {
+    Serial.println("Fixed Box B MAC equals own MAC or is zero; use broadcast discovery only.");
+  }
+
+  ensureEspNowPeer(ESP_NOW_BROADCAST_MAC);
+
+  espNowReady = true;
+  Serial.println("ESP-NOW peer ready");
+  printMacAddress("ESP-NOW broadcast", ESP_NOW_BROADCAST_MAC);
+}
+
+void sendCommandToB() {
+  if (!espNowReady) return;
+
+  // Keep the latest B settings in every ESP-NOW packet.
+  // Box B has no Firebase/NTP; Box A Gateway is the single source of truth.
+  cmdB.wateringSeconds = validWateringSeconds(cmdB.wateringSeconds);
+  cmdB.noWaterTimeoutSeconds = validWateringSeconds(boxBNoWaterTimeoutSeconds);
+  cmdB.useRainStopRule = boxBUseRainStopRule;
+  cmdB.weatherBlocked = (weatherBlockedB || boxBWeatherBlocked) && !offlineScheduleBypassBByGateway();
+  cmdB.weatherRainProbability = weatherRainProbabilityB;
+  cmdB.weatherPrecipitationMM = weatherPrecipitationMMB;
+  cmdB.offlineScheduleBypass = offlineScheduleBypassBByGateway();
+  cmdB.heartbeatSeq = ++cmdBSeq;
+  prepareCommandBProtocol();
+
+  uint8_t ownMac[6] = {0};
+  getOwnStaMac(ownMac);
+
+  bool haveUnicastTarget = (!macIsZero(activeBoxBMac) && !macEquals(activeBoxBMac, ownMac));
+  if (haveUnicastTarget) {
+    ensureEspNowPeer(activeBoxBMac);
+    esp_err_t result = esp_now_send(activeBoxBMac, (uint8_t *)&cmdB, sizeof(cmdB));
+    espNowUnicastCount++;
+    if (result != ESP_OK) {
+      Serial.print("ESP-NOW unicast send failed code=");
+      Serial.print((int)result);
+      Serial.print(" target=");
+      printMacAddress("", activeBoxBMac);
+    }
+  }
+
+  // Discovery packet: while Box B is offline or not learned, broadcast the same command.
+  // This makes Box B reply with StatusFromB so Box A can learn the real Box B STA MAC.
+  bool needDiscovery = (!activeBoxBMacLearned || !boxBOnline || lastBoxBSeen == 0 || millis() - lastBoxBSeen > 5000UL);
+  if (needDiscovery) {
+    ensureEspNowPeer(ESP_NOW_BROADCAST_MAC);
+    // Broadcast a short burst while Box B is offline. Box B may be channel-hopping,
+    // and Firebase HTTPS calls can delay A's loop; multiple broadcasts greatly
+    // improve the chance that B catches A when both are on the same channel.
+    for (int i = 0; i < 3; i++) {
+      esp_err_t bcastResult = esp_now_send(ESP_NOW_BROADCAST_MAC, (uint8_t *)&cmdB, sizeof(cmdB));
+      espNowBroadcastCount++;
+      if (bcastResult != ESP_OK) {
+        Serial.print("ESP-NOW broadcast discovery failed code=");
+        Serial.println((int)bcastResult);
+      }
+      delay(12);
+    }
+  }
+
+  if (millis() - lastBoxBDebugPrint >= 5000UL) {
+    lastBoxBDebugPrint = millis();
+    uint8_t ch = 0;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    esp_wifi_get_channel(&ch, &second);
+    Serial.print("ESP-NOW B debug ch=");
+    Serial.print(ch);
+    Serial.print(" online=");
+    Serial.print(boxBOnline);
+    Serial.print(" learnedMac=");
+    Serial.print(activeBoxBMacLearned);
+    Serial.print(" sendOK=");
+    Serial.print(espNowSendOkCount);
+    Serial.print(" sendFAIL=");
+    Serial.print(espNowSendFailCount);
+    Serial.print(" uni=");
+    Serial.print(espNowUnicastCount);
+    Serial.print(" bcast=");
+    Serial.print(espNowBroadcastCount);
+    Serial.print(" target=");
+    printMacAddress("", activeBoxBMac);
+  }
+}
+
+void espNowStartupDiscoveryBurst(const char *reason) {
+  Serial.print("ESP-NOW startup discovery burst reason=");
+  Serial.println(reason ? reason : "");
+  for (int i = 0; i < 40; i++) {
+    sendCommandToB();
+    delay(50);
+  }
+}
+
+
+void clearBoxBOneShotCommand(const char *reason) {
+  // v22: Box B actions are one-shot commands.
+  // After the short fast-send burst, clear all action bits and requestId so a Box B reboot
+  // cannot replay an old ON/OFF/AP/CLEAR command from the next heartbeat.
+  cmdB.manualMode = false;
+  cmdB.manualValve = false;
+  cmdB.autoMode = true;
+  cmdB.startWaterRequest = false;
+  cmdB.clearTodayStatus = false;
+  cmdB.requestLocalAP = false;
+  cmdB.offlineScheduleBypass = false;
+  cmdB.requestId = 0;
+  Serial.print("Clear Box B one-shot command reason=");
+  Serial.println(reason ? reason : "");
+}
+
+void readSensors() {
+  int rainRaw = digitalRead(PIN_RAIN);
+  sensorWet = RAIN_SENSOR_ACTIVE_LOW ? (rainRaw == LOW) : (rainRaw == HIGH);
+
+  unsigned long now = millis();
+  if (sensorWet) {
+    if (sensorWetStartMillis == 0) sensorWetStartMillis = now;
+  } else {
+    sensorWetStartMillis = 0;
+  }
+
+  if (valveState) {
+    // 澆水中，雨滴感測器改作出水確認。
+    rainState = false;
+  } else {
+    // 電磁閥關閉時只顯示即時雨滴/潮濕，不提前鎖死今日排程。
+    // 是否停止排程，統一在排程觸發前即時判斷。
+    waterDetected = false;
+    rainState = sensorWet;
+  }
+}
+
+
+void printSettingsSummaryAB(const char *reason) {
+  Serial.print("Settings read done reason=");
+  Serial.print(reason ? reason : "");
+  Serial.print(" | A scheduleEnabled=");
+  Serial.print(scheduleEnabled);
+  Serial.print(" schedule=");
+  Serial.print(schedule1);
+  Serial.print("/");
+  Serial.print(schedule2);
+  Serial.print(" wateringSeconds=");
+  Serial.print(wateringSeconds);
+  Serial.print(" noWaterTimeout=");
+  Serial.print(noWaterTimeoutSeconds);
+  Serial.print(" rainRule=");
+  Serial.print(useRainStopRule);
+  Serial.print(" weatherRule=");
+  Serial.print(useWeatherRule);
+  Serial.print(" offlineContinue=");
+  Serial.print(offlineScheduleContinue);
+  Serial.print(" | B scheduleEnabled=");
+  Serial.print(cmdB.scheduleEnabled);
+  Serial.print(" schedule=");
+  Serial.print(boxBSchedule1);
+  Serial.print("/");
+  Serial.print(boxBSchedule2);
+  Serial.print(" wateringSeconds=");
+  Serial.print(cmdB.wateringSeconds);
+  Serial.print(" noWaterTimeout=");
+  Serial.print(boxBNoWaterTimeoutSeconds);
+  Serial.print(" rainRule=");
+  Serial.print(boxBUseRainStopRule);
+  Serial.print(" offlineContinue=");
+  Serial.println(boxBOfflineScheduleContinue);
+}
+
+void refreshBoxASettingsOnce(const char *reason) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String payload;
+  if (!firebaseGetRaw(basePath(), payload)) return;
+
+  DynamicJsonDocument doc(12288);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("A settings refresh parse failed: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  bool oldScheduleEnabled = scheduleEnabled;
+  String oldSchedule1 = schedule1;
+  String oldSchedule2 = schedule2;
+  int oldWateringSeconds = wateringSeconds;
+  int oldNoWaterTimeoutSeconds = noWaterTimeoutSeconds;
+
+  firebaseGetBoolFromJson(doc, "scheduleEnabled", scheduleEnabled);
+  firebaseGetBoolFromJson(doc, "offlineScheduleContinue", offlineScheduleContinue);
+  firebaseGetBoolFromJson(doc, "useRainStopRule", useRainStopRule);
+  firebaseGetBoolFromJson(doc, "useWeatherRule", useWeatherRule);
+
+  int tempInt = wateringSeconds;
+  if (firebaseGetIntFromJson(doc, "wateringSeconds", tempInt)) wateringSeconds = validWateringSeconds(tempInt);
+  tempInt = noWaterTimeoutSeconds;
+  if (firebaseGetIntFromJson(doc, "noWaterTimeoutSeconds", tempInt)) noWaterTimeoutSeconds = validWateringSeconds(tempInt);
+
+  firebaseGetStringFromJson(doc, "schedule1", schedule1);
+  firebaseGetStringFromJson(doc, "schedule2", schedule2);
+
+  if (oldSchedule1 != schedule1 || oldSchedule2 != schedule2 || oldScheduleEnabled != scheduleEnabled ||
+      oldWateringSeconds != wateringSeconds || oldNoWaterTimeoutSeconds != noWaterTimeoutSeconds) {
+    Serial.print("A runtime settings updated before action: enabled=");
+    Serial.print(scheduleEnabled);
+    Serial.print(" schedule=");
+    Serial.print(schedule1);
+    Serial.print("/");
+    Serial.print(schedule2);
+    Serial.print(" wateringSeconds=");
+    Serial.print(wateringSeconds);
+    Serial.print(" noWaterTimeout=");
+    Serial.println(noWaterTimeoutSeconds);
+  }
+
+  if (oldSchedule1 != schedule1 || oldSchedule2 != schedule2) {
+    lastScheduleStartKeyA = "";
+    lastScheduleSkipKeyA = "";
+    manualStoppedScheduleKeyA = "";
+    lastNoWaterFaultKeyA = "";
+    lastScheduleAttemptMillis = 0;
+  }
+
+  saveScheduleSettingsToNVS();
+}
+
+void refreshBoxBSettingsOnce(const char *reason) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String payload;
+  if (!firebaseGetRaw("/boxes/boxB", payload)) return;
+
+  DynamicJsonDocument doc(12288);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("B settings refresh parse failed: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  bool oldScheduleEnabled = cmdB.scheduleEnabled;
+  String oldSchedule1 = boxBSchedule1;
+  String oldSchedule2 = boxBSchedule2;
+  int oldWateringSeconds = cmdB.wateringSeconds;
+  int oldNoWaterTimeoutSeconds = boxBNoWaterTimeoutSeconds;
+
+  firebaseGetBoolFromJson(doc, "scheduleEnabled", cmdB.scheduleEnabled);
+  firebaseGetBoolFromJson(doc, "offlineScheduleContinue", boxBOfflineScheduleContinue);
+  firebaseGetBoolFromJson(doc, "useRainStopRule", boxBUseRainStopRule);
+
+  int tempInt = cmdB.wateringSeconds;
+  if (firebaseGetIntFromJson(doc, "wateringSeconds", tempInt)) cmdB.wateringSeconds = validWateringSeconds(tempInt);
+  tempInt = boxBNoWaterTimeoutSeconds;
+  if (firebaseGetIntFromJson(doc, "noWaterTimeoutSeconds", tempInt)) boxBNoWaterTimeoutSeconds = validWateringSeconds(tempInt);
+  cmdB.noWaterTimeoutSeconds = boxBNoWaterTimeoutSeconds;
+  cmdB.useRainStopRule = boxBUseRainStopRule;
+
+  firebaseGetStringFromJson(doc, "schedule1", boxBSchedule1);
+  firebaseGetStringFromJson(doc, "schedule2", boxBSchedule2);
+
+  if (oldSchedule1 != boxBSchedule1 || oldSchedule2 != boxBSchedule2 || oldScheduleEnabled != cmdB.scheduleEnabled ||
+      oldWateringSeconds != cmdB.wateringSeconds || oldNoWaterTimeoutSeconds != boxBNoWaterTimeoutSeconds) {
+    Serial.print("B runtime settings updated before action: enabled=");
+    Serial.print(cmdB.scheduleEnabled);
+    Serial.print(" schedule=");
+    Serial.print(boxBSchedule1);
+    Serial.print("/");
+    Serial.print(boxBSchedule2);
+    Serial.print(" wateringSeconds=");
+    Serial.print(cmdB.wateringSeconds);
+    Serial.print(" noWaterTimeout=");
+    Serial.println(boxBNoWaterTimeoutSeconds);
+  }
+
+  if (oldSchedule1 != boxBSchedule1 || oldSchedule2 != boxBSchedule2) {
+    lastBoxBScheduleStartKey = "";
+    lastBoxBScheduleSkipKey = "";
+    manualStoppedBoxBScheduleKey = "";
+    lastBoxBScheduleAttemptMillis = 0;
+  }
+
+  saveScheduleSettingsToNVS();
+}
+
+void readFastCommand() {
+  // Ultra-fast manual command channel.
+  // Read only /commands/boxA and /commands/boxB here.
+  // Do not read the whole /commands tree or /boxes every 150 ms,
+  // otherwise HTTPS GET becomes slow and GPIO4 reaction feels delayed.
+
+  String payloadA;
+  if (firebaseGetRaw("/commands/boxA", payloadA)) {
+    DynamicJsonDocument docA(2048);
+    DeserializationError errA = deserializeJson(docA, payloadA);
+
+    if (!errA) {
+      uint64_t seq = readCommandSeq(docA["commandSeq"]);
+
+      if (seq != 0 && seq != lastCommandSeqSeen) {
+        lastCommandSeqSeen = seq;
+
+        bool mMode = docA["manualMode"] | false;
+        bool mValve = docA["manualValve"] | false;
+        bool resumeAuto = docA["resumeAuto"] | false;
+        bool clearFault = docA["clearFault"] | false;
+        bool clearTodayCmd = docA["clearTodayStatus"] | false;
+        bool requestLocalAPCmd = docA["requestLocalAP"] | false;
+        String commandSource = docA["commandSource"] | "";
+
+        Serial.print("FAST COMMAND A from=/commands/boxA seq=");
+        Serial.print(u64ToString(seq));
+        Serial.print(" manualMode="); Serial.print(mMode);
+        Serial.print(" manualValve="); Serial.print(mValve);
+        Serial.print(" resumeAuto="); Serial.println(resumeAuto);
+        refreshBoxASettingsOnce("fast_command_A");
+        if (resumeAuto || mMode) lastManualCommandMillisA = millis();
+
+        if (requestLocalAPCmd && commandSource == "web_local_ap") {
+          startAPMode();
+          lastCommandSeqAckA = seq;
+          firebasePutBool("/commands/boxA/requestLocalAP", false);
+          firebasePutBool(ownPath("/requestLocalAP"), false);
+          firebasePutBool(ownPath("/localAPActive"), apRunning);
+          firebasePutString(ownPath("/localAPSSID"), AP_SSID);
+          firebasePutString(ownPath("/localAPIP"), WiFi.softAPIP().toString());
+          statusDirty = true;
+          uploadStatus();
+        } else if (clearTodayCmd && commandSource == "web_clear_today") {
+          clearTodayState();
+          firebasePutBool("/commands/boxA/clearTodayStatus", false);
+          lastCommandSeqAckA = seq;
+          statusDirty = true;
+          uploadStatus();
+        } else {
+          if (clearTodayCmd && commandSource != "web_clear_today") {
+            firebasePutBool("/commands/boxA/clearTodayStatus", false);
+          }
+
+          if (clearFault || mMode) {
+            valveFault = false;
+            faultReason = "";
+            waterDetected = false;
+            wateringConfirmed = false;
+          }
+
+          if (resumeAuto) {
+            manualMode = false;
+            manualValve = false;
+            autoMode = true;
+            currentWateringFromScheduleA = false;
+            currentScheduleKeyA = "";
+            forceValveImmediate(false, "fast_resume_auto");
+            updateLastValveAction("fast_resume_auto", "resume auto");
+          } else if (mMode && mValve) {
+            manualMode = true;
+            manualValve = true;
+            autoMode = false;
+            valveFault = false;
+            faultReason = "";
+            waterDetected = false;
+            wateringConfirmed = false;
+            forceValveImmediate(true, "manual_fast_on");
+            updateLastValveAction("manual_fast_on", "manual command on");
+          } else if (mMode && !mValve) {
+            if (currentWateringFromScheduleA) {
+              markCurrentScheduleHandledA("schedule_manual_stop_recorded");
+            } else if (matchedScheduleSlotA().length() > 0) {
+              markCurrentScheduleWindowHandledA("manual_off_inside_schedule_window");
+            }
+            waterDetected = false;
+            wateringConfirmed = false;
+            currentWateringFromScheduleA = false;
+            currentScheduleKeyA = "";
+            forceValveImmediate(false, "manual_fast_off");
+            manualMode = false;
+            manualValve = false;
+            autoMode = true;
+            updateLastValveAction("manual_fast_off", "manual command off");
+          }
+          lastCommandSeqAckA = seq;
+          statusDirty = true;
+          uploadStatus();
+        }
+      }
+    } else {
+      Serial.print("FAST COMMAND A parse failed: ");
+      Serial.println(errA.c_str());
+    }
+  }
+
+  String payloadB;
+  if (firebaseGetRaw("/commands/boxB", payloadB)) {
+    DynamicJsonDocument docB(2048);
+    DeserializationError errB = deserializeJson(docB, payloadB);
+
+    if (!errB) {
+      uint64_t seqB = readCommandSeq(docB["commandSeq"]);
+
+      if (seqB != 0 && seqB != lastCommandSeqSeenB) {
+        lastCommandSeqSeenB = seqB;
+        lastCommandSeqAckB = seqB;
+
+        bool resumeAutoB = docB["resumeAuto"] | false;
+        bool clearTodayB = (docB["clearTodayStatus"] | false) || (docB["clearFault"] | false);
+        bool requestLocalAPB = docB["requestLocalAP"] | false;
+        bool hasManualFieldB = docB["manualMode"].is<bool>() || docB["manualValve"].is<bool>();
+        bool isActionCommandB = hasManualFieldB || resumeAutoB || clearTodayB || requestLocalAPB;
+
+        refreshBoxBSettingsOnce("fast_command_B");
+
+        // Settings-only pings, such as scheduleSavePing/settingsPing, must not become a valve action.
+        // They only refresh runtime settings and send a neutral heartbeat to Box B.
+        if (!isActionCommandB) {
+          Serial.print("FAST COMMAND B settings-only from=/commands/boxB seq=");
+          Serial.println(u64ToString(seqB));
+          cmdB.requestId = 0;
+          cmdB.startWaterRequest = false;
+          cmdB.clearTodayStatus = false;
+          cmdB.requestLocalAP = false;
+          cmdB.offlineScheduleBypass = offlineScheduleBypassBByGateway();
+          sendCommandToB();
+          uploadStatus();
+          return;
+        }
+
+        cmdB.manualMode = resumeAutoB ? false : (docB["manualMode"] | false);
+        cmdB.manualValve = resumeAutoB ? false : (docB["manualValve"] | false);
+        cmdB.autoMode = resumeAutoB ? true : !cmdB.manualMode;
+        cmdB.requestId = (uint32_t)(seqB & 0xFFFFFFFFULL);
+        if (cmdB.requestId == 0) cmdB.requestId = 1;
+        cmdB.startWaterRequest = false;
+        cmdB.clearTodayStatus = clearTodayB;
+        cmdB.requestLocalAP = requestLocalAPB;
+
+        // Manual control clears old no-water fault and is sent immediately.
+        if (cmdB.manualMode) {
+          cmdB.clearTodayStatus = true;
+          if (!cmdB.manualValve && matchedScheduleSlotBByGateway().length() > 0) {
+            markCurrentScheduleWindowHandledBByGateway("manual_off_inside_schedule_window");
+          }
+        }
+
+        Serial.print("FAST COMMAND B action from=/commands/boxB seq=");
+        Serial.print(u64ToString(seqB));
+        Serial.print(" manualMode=");
+        Serial.print(cmdB.manualMode);
+        Serial.print(" manualValve=");
+        Serial.print(cmdB.manualValve);
+        Serial.print(" resumeAuto=");
+        Serial.print(resumeAutoB);
+        Serial.print(" clear=");
+        Serial.print(cmdB.clearTodayStatus);
+        Serial.print(" requestAP=");
+        Serial.println(cmdB.requestLocalAP);
+
+        // v23: optimistic local state first. This prevents uploadStatus() from writing
+        // the old Box B valve state back to Firebase while waiting for B's return status.
+        if (cmdB.manualMode) {
+          boxBValve = cmdB.manualValve;
+          boxBValveFault = false;
+          boxBWaterDetected = false;
+          boxBWateringConfirmed = false;
+          if (!cmdB.manualValve) {
+            boxBRemain = 0;
+            boxBScheduleRemainSeconds = 0;
+            boxBNoWaterTimeoutRemainSeconds = 0;
+          }
+        }
+
+        // v23: short but dense burst. OFF must feel as fast as ON.
+        // Keep this before any uploadStatus()/Firebase write.
+        for (int i = 0; i < 80; i++) {
+          sendCommandToB();
+          delay(5);
+        }
+
+        clearBoxBOneShotCommand("fast_command_B_sent");
+        sendCommandToB();
+        uploadStatus();
+      }
+    } else {
+      Serial.print("FAST COMMAND B parse failed: ");
+      Serial.println(errB.c_str());
+    }
+  }
+
+}
+
+
+void primeCommandSeqsFromFirebase(const char *reason) {
+  // v13 fix:
+  // On reboot, /commands/boxA and /commands/boxB may still contain the last commandSeq.
+  // If lastCommandSeqSeen starts from 0, the gateway replays that old ON/OFF command once.
+  // Prime the sequence numbers at boot/reconnect so only NEW web commands take action.
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String payloadA;
+  if (firebaseGetRaw("/commands/boxA", payloadA)) {
+    DynamicJsonDocument docA(2048);
+    DeserializationError errA = deserializeJson(docA, payloadA);
+    if (!errA) {
+      uint64_t seqA = readCommandSeq(docA["commandSeq"]);
+      if (seqA != 0) {
+        lastCommandSeqSeen = seqA;
+        lastCommandSeqAckA = seqA;
+        Serial.print("Prime commandSeq A reason=");
+        Serial.print(reason ? reason : "");
+        Serial.print(" seq=");
+        Serial.println(u64ToString(seqA));
+      }
+    }
+  }
+
+  String payloadB;
+  if (firebaseGetRaw("/commands/boxB", payloadB)) {
+    DynamicJsonDocument docB(2048);
+    DeserializationError errB = deserializeJson(docB, payloadB);
+    if (!errB) {
+      uint64_t seqB = readCommandSeq(docB["commandSeq"]);
+      if (seqB != 0) {
+        lastCommandSeqSeenB = seqB;
+        lastCommandSeqAckB = seqB;
+        Serial.print("Prime commandSeq B reason=");
+        Serial.print(reason ? reason : "");
+        Serial.print(" seq=");
+        Serial.println(u64ToString(seqB));
+      }
+    }
+  }
+}
+
+void readFirebaseSettings() {
+  String payloadA;
+  if (firebaseGetRaw(basePath(), payloadA)) {
+    DynamicJsonDocument docA(12288);
+    DeserializationError errA = deserializeJson(docA, payloadA);
+    if (!errA) {
+      bool allowFirebaseManualState = (millis() - lastManualCommandMillisA > 2000UL);
+      if (allowFirebaseManualState) {
+        firebaseGetBoolFromJson(docA, "manualMode", manualMode);
+        firebaseGetBoolFromJson(docA, "manualValve", manualValve);
+        firebaseGetBoolFromJson(docA, "autoMode", autoMode);
+      }
+      bool oldScheduleEnabledA = scheduleEnabled;
+      firebaseGetBoolFromJson(docA, "scheduleEnabled", scheduleEnabled);
+      firebaseGetBoolFromJson(docA, "offlineScheduleContinue", offlineScheduleContinue);
+
+      int tempInt = wateringSeconds;
+      if (firebaseGetIntFromJson(docA, "wateringSeconds", tempInt)) wateringSeconds = validWateringSeconds(tempInt);
+      tempInt = noWaterTimeoutSeconds;
+      if (firebaseGetIntFromJson(docA, "noWaterTimeoutSeconds", tempInt)) noWaterTimeoutSeconds = validWateringSeconds(tempInt);
+      firebaseGetBoolFromJson(docA, "useRainStopRule", useRainStopRule);
+      firebaseGetBoolFromJson(docA, "useWeatherRule", useWeatherRule);
+      String oldSchedule1 = schedule1;
+      String oldSchedule2 = schedule2;
+      firebaseGetStringFromJson(docA, "schedule1", schedule1);
+      firebaseGetStringFromJson(docA, "schedule2", schedule2);
+      if (schedule1 != oldSchedule1 || schedule2 != oldSchedule2) {
+        if (currentWateringFromScheduleA) {
+          Serial.println("Schedule A time changed while watering. Stop old schedule run immediately.");
+          markCurrentScheduleHandledA("schedule_changed_stop_recorded");
+          currentWateringFromScheduleA = false;
+          currentScheduleKeyA = "";
+          waterDetected = false;
+          wateringConfirmed = false;
+          forceValveImmediate(false, "schedule_changed_off");
+          updateLastValveAction("schedule_changed_off", "schedule changed");
+        }
+        lastScheduleStartKeyA = ""; lastScheduleSkipKeyA = ""; manualStoppedScheduleKeyA = ""; lastNoWaterFaultKeyA = ""; lastScheduleAttemptMillis = 0;
+        Serial.print("Schedule A updated: ");
+        Serial.print(schedule1);
+        Serial.print(" / ");
+        Serial.println(schedule2);
+      }
+
+      if (!oldScheduleEnabledA && scheduleEnabled) markCurrentScheduleWindowHandledA("schedule_enabled_late_no_catchup");
+
+      bool clearA = false;
+      if (firebaseGetBoolFromJson(docA, "clearTodayStatus", clearA) && clearA) clearTodayState();
+
+      bool requestLocalAPA = false;
+      if (firebaseGetBoolFromJson(docA, "requestLocalAP", requestLocalAPA) && requestLocalAPA) {
+        startAPMode();
+        firebasePutBool(ownPath("/requestLocalAP"), false);
+        firebasePutString(ownPath("/localAPMessage"), "AP active for 20 minutes");
+      }
+    }
+  }
+
+  String payloadB;
+  if (firebaseGetRaw("/boxes/boxB", payloadB)) {
+    DynamicJsonDocument docB(12288);
+    DeserializationError errB = deserializeJson(docB, payloadB);
+    if (!errB) {
+      bool oldScheduleEnabledB = cmdB.scheduleEnabled;
+      // v12: Do not read boxB manualMode/manualValve/autoMode from /boxes/boxB here.
+      // Only /commands/boxB is allowed to change Box B's relay.
+      // This prevents A-zone status/settings refresh from sending a stale OFF command to Box B.
+      firebaseGetBoolFromJson(docB, "scheduleEnabled", cmdB.scheduleEnabled);
+      firebaseGetBoolFromJson(docB, "offlineScheduleContinue", boxBOfflineScheduleContinue);
+
+      int tempInt = cmdB.wateringSeconds;
+      if (firebaseGetIntFromJson(docB, "wateringSeconds", tempInt)) cmdB.wateringSeconds = validWateringSeconds(tempInt);
+      tempInt = boxBNoWaterTimeoutSeconds;
+      if (firebaseGetIntFromJson(docB, "noWaterTimeoutSeconds", tempInt)) boxBNoWaterTimeoutSeconds = validWateringSeconds(tempInt);
+      cmdB.noWaterTimeoutSeconds = boxBNoWaterTimeoutSeconds;
+      firebaseGetBoolFromJson(docB, "useRainStopRule", boxBUseRainStopRule);
+      cmdB.useRainStopRule = boxBUseRainStopRule;
+      String oldBoxBSchedule1 = boxBSchedule1;
+      String oldBoxBSchedule2 = boxBSchedule2;
+      firebaseGetStringFromJson(docB, "schedule1", boxBSchedule1);
+      firebaseGetStringFromJson(docB, "schedule2", boxBSchedule2);
+      if (boxBSchedule1 != oldBoxBSchedule1 || boxBSchedule2 != oldBoxBSchedule2) {
+        lastBoxBScheduleStartKey = ""; lastBoxBScheduleSkipKey = ""; manualStoppedBoxBScheduleKey = ""; lastBoxBScheduleAttemptMillis = 0;
+        Serial.print("Schedule B updated: ");
+        Serial.print(boxBSchedule1);
+        Serial.print(" / ");
+        Serial.println(boxBSchedule2);
+      }
+
+      if (!oldScheduleEnabledB && cmdB.scheduleEnabled) markCurrentScheduleWindowHandledBByGateway("schedule_enabled_late_no_catchup");
+
+      cmdB.clearTodayStatus = false;
+      bool clearB = false;
+      if (firebaseGetBoolFromJson(docB, "clearTodayStatus", clearB) && clearB) {
+        cmdB.clearTodayStatus = true;
+        cmdB.scheduleEnabled = true;
+        markCurrentScheduleWindowHandledBByGateway("clear_today_restore_schedule_no_catchup");
+        firebasePutBool(boxBPath("/clearTodayStatus"), false);
+        firebasePutBool(boxBPath("/scheduleEnabled"), true);
+      }
+
+      cmdB.requestLocalAP = false;
+      bool requestLocalAPB = false;
+      if (firebaseGetBoolFromJson(docB, "requestLocalAP", requestLocalAPB) && requestLocalAPB) {
+        cmdB.requestLocalAP = true;
+        firebasePutBool(boxBPath("/requestLocalAP"), false);
+        firebasePutString(boxBPath("/localAPMessage"), "AP request sent to Box B for 20 minutes");
+      }
+    }
+  }
+
+  cmdB.rain = rainBlockedToday || rainState;
+  cmdB.weatherBlocked = weatherBlockedB;
+  cmdB.weatherRainProbability = weatherRainProbabilityB;
+  cmdB.weatherPrecipitationMM = weatherPrecipitationMMB;
+  cmdB.startWaterRequest = false;
+  cmdB.wateringSeconds = validWateringSeconds(cmdB.wateringSeconds);
+  cmdB.noWaterTimeoutSeconds = validWateringSeconds(boxBNoWaterTimeoutSeconds);
+  cmdB.useRainStopRule = boxBUseRainStopRule;
+
+  // B 區排程啟動統一交給 controlLogicBByGateway()，避免 readFirebaseSettings() 裡舊邏輯重複觸發。
+
+  printSettingsSummaryAB("periodic_settings_read");
+  saveScheduleSettingsToNVS();
+}
+
+String matchedScheduleSlotA() {
+  if (scheduleTimeMatchesNow(schedule1)) return "1";
+  if (scheduleTimeMatchesNow(schedule2)) return "2";
+  return "";
+}
+
+String scheduleTimeBySlotA(const String &slot) {
+  if (slot == "1") return schedule1;
+  if (slot == "2") return schedule2;
+  return currentHHMM();
+}
+
+String makeScheduleKeyA(const String &slot) {
+  String key = todayString();
+  key.concat("_");
+  key.concat(slot);
+  key.concat("_");
+  key.concat(scheduleTimeBySlotA(slot));
+  return key;
+}
+
+void markCurrentScheduleWindowHandledA(const String &reason) {
+  String slot = matchedScheduleSlotA();
+  if (slot.length() == 0) return;
+  String key = makeScheduleKeyA(slot);
+  lastScheduleStartKeyA = key;
+  lastScheduleSkipKeyA = key;
+  manualStoppedScheduleKeyA = key;
+  Serial.print("SCHEDULE A WINDOW MARKED HANDLED: ");
+  Serial.print(key);
+  Serial.print(" reason=");
+  Serial.println(reason);
+  pushEvent("schedule_window_handled", String("A區目前時間仍在排程觸發視窗內，此時段已標記為處理完成，不補做。key=") + key + " reason=" + reason);
+}
+
+void markCurrentScheduleHandledA(const String &reason) {
+  if (!currentWateringFromScheduleA || currentScheduleKeyA.length() == 0) return;
+  manualStoppedScheduleKeyA = currentScheduleKeyA;
+  lastScheduleStartKeyA = currentScheduleKeyA;
+  lastScheduleSkipKeyA = currentScheduleKeyA;
+  Serial.print("SCHEDULE A SLOT RECORDED AS HANDLED: ");
+  Serial.print(currentScheduleKeyA);
+  Serial.print(" reason=");
+  Serial.println(reason);
+  pushEvent("schedule_slot_handled", String("A區排程時段已記錄完成，不會重複啟動。key=") + currentScheduleKeyA + " reason=" + reason);
+  currentWateringFromScheduleA = false;
+  currentScheduleKeyA = "";
+}
+
+int scheduleRemainSecondsA() {
+  if (!valveState || !currentWateringFromScheduleA) return 0;
+  unsigned long elapsed = (millis() - valveStartMillis) / 1000UL;
+  if (elapsed >= (unsigned long)wateringSeconds) return 0;
+  return wateringSeconds - (int)elapsed;
+}
+
+int noWaterTimeoutRemainSecondsA() {
+  if (!valveState || wateringConfirmed) return 0;
+  unsigned long elapsed = (millis() - valveStartMillis) / 1000UL;
+  int timeoutSec = noWaterTimeoutSeconds < 1 ? 1 : noWaterTimeoutSeconds;
+  if (elapsed >= (unsigned long)timeoutSec) return 0;
+  return timeoutSec - (int)elapsed;
+}
+
+bool wifiConnectedNowA() {
+  return wifiOK && WiFi.status() == WL_CONNECTED;
+}
+
+bool offlineScheduleBypassA() {
+  return offlineScheduleContinue && !wifiConnectedNowA();
+}
+
+bool rainSensorShouldBlockScheduleNowA(unsigned long now) {
+  (void)now;
+  if (!useRainStopRule) return false;
+  // A 區與 Box C 一樣：只在排程準備啟動前即時檢查雨滴感測器。
+  // 排程啟動後 sensorWet 改作出水確認，不會立刻停止排程。
+  return sensorWet;
+}
+
+bool canScheduleWaterA() {
+  if (manualMode && manualValve) return false;
+  if (offlineScheduleBypassA()) return true;
+  if (valveFault) return false;
+  // 雨滴/潮濕不在這裡用 rainBlockedToday 永久阻擋。
+  // 真正判斷點在排程啟動前 rainSensorShouldBlockScheduleNowA(now)。
+  if (useWeatherRule && weatherBlockedA) return false;
+  return true;
+}
+
+void printScheduleWatchA() {
+  Serial.print("SCHEDULE A WATCH now=");
+  Serial.print(currentHHMM());
+  Serial.print(" s1="); Serial.print(schedule1);
+  Serial.print(" s2="); Serial.print(schedule2);
+  Serial.print(" enabled="); Serial.print(scheduleEnabled);
+  Serial.print(" manualMode="); Serial.print(manualMode);
+  Serial.print(" manualValve="); Serial.print(manualValve);
+  Serial.print(" valve="); Serial.print(valveState);
+  Serial.print(" fault="); Serial.print(valveFault);
+  Serial.print(" rainRule="); Serial.print(useRainStopRule);
+  Serial.print(" rainBlocked="); Serial.print(rainBlockedToday);
+  Serial.print(" weatherRule="); Serial.print(useWeatherRule);
+  Serial.print(" weatherBlocked="); Serial.print(weatherBlockedA);
+  Serial.print(" offlineContinue="); Serial.print(offlineScheduleContinue);
+  Serial.print(" offlineBypass="); Serial.print(offlineScheduleBypassA());
+  Serial.print(" sensorWet="); Serial.print(sensorWet);
+  Serial.print(" wetMs="); Serial.println(sensorWetStartMillis > 0 ? millis() - sensorWetStartMillis : 0);
+}
+
+
+void printScheduleWatchBByGateway() {
+  Serial.print("SCHEDULE B WATCH now=");
+  Serial.print(currentHHMM());
+  Serial.print(" s1="); Serial.print(boxBSchedule1);
+  Serial.print(" s2="); Serial.print(boxBSchedule2);
+  Serial.print(" enabled="); Serial.print(cmdB.scheduleEnabled);
+  Serial.print(" manualMode="); Serial.print(cmdB.manualMode);
+  Serial.print(" manualValve="); Serial.print(cmdB.manualValve);
+  Serial.print(" valve="); Serial.print(boxBValve);
+  Serial.print(" fault="); Serial.print(boxBValveFault);
+  Serial.print(" rainRule="); Serial.print(boxBUseRainStopRule);
+  Serial.print(" sensorWet="); Serial.print(boxBSensorWet);
+  Serial.print(" rainBlocked="); Serial.print(boxBRainBlockedToday);
+  Serial.print(" weatherBlocked="); Serial.print(weatherBlockedB || boxBWeatherBlocked);
+  Serial.print(" offlineContinue="); Serial.print(boxBOfflineScheduleContinue);
+  Serial.print(" offlineBypass="); Serial.println(offlineScheduleBypassBByGateway());
+}
+
+String matchedScheduleSlotBByGateway() {
+  if (scheduleTimeMatchesNow(boxBSchedule1)) return "1";
+  if (scheduleTimeMatchesNow(boxBSchedule2)) return "2";
+  return "";
+}
+
+String scheduleTimeBySlotBByGateway(const String &slot) {
+  if (slot == "1") return boxBSchedule1;
+  if (slot == "2") return boxBSchedule2;
+  return currentHHMM();
+}
+
+String makeScheduleKeyBByGateway(const String &slot) {
+  String key = todayString();
+  key.concat("_");
+  key.concat(slot);
+  key.concat("_");
+  key.concat(scheduleTimeBySlotBByGateway(slot));
+  return key;
+}
+
+void markCurrentScheduleWindowHandledBByGateway(const String &reason) {
+  String slot = matchedScheduleSlotBByGateway();
+  if (slot.length() == 0) return;
+  String key = makeScheduleKeyBByGateway(slot);
+  lastBoxBScheduleStartKey = key;
+  lastBoxBScheduleSkipKey = key;
+  manualStoppedBoxBScheduleKey = key;
+  Serial.print("SCHEDULE B WINDOW MARKED HANDLED: ");
+  Serial.print(key);
+  Serial.print(" reason=");
+  Serial.println(reason);
+  pushEventForBox("boxB", "schedule_window_handled", String("B區目前時間仍在排程觸發視窗內，此時段已標記為處理完成，不補做。key=") + key + " reason=" + reason);
+}
+
+int remainSeconds() {
+  return scheduleRemainSecondsA();
+}
+
+bool offlineScheduleBypassBByGateway() {
+  return boxBOfflineScheduleContinue && !wifiConnectedNowA();
+}
+
+bool canScheduleWaterBByGateway() {
+  if (cmdB.manualMode && cmdB.manualValve) return false;
+  if (offlineScheduleBypassBByGateway()) return true;
+  if (boxBValveFault) return false;
+  // B 區雨滴/潮濕由排程啟動前即時檢查 boxBSensorWet，不用 rainBlockedToday 永久阻擋。
+  if (weatherBlockedB || boxBWeatherBlocked) return false;
+  return true;
+}
+
+void controlLogicBByGateway() {
+  unsigned long now = millis();
+  if (now - lastScheduleWatchPrintB >= 10000UL) {
+    lastScheduleWatchPrintB = now;
+    printScheduleWatchBByGateway();
+  }
+
+  if (cmdB.manualMode && cmdB.manualValve) return;
+
+  cmdB.startWaterRequest = false;
+  cmdB.weatherBlocked = (weatherBlockedB || boxBWeatherBlocked) && !offlineScheduleBypassBByGateway();
+  cmdB.weatherRainProbability = weatherRainProbabilityB;
+  cmdB.weatherPrecipitationMM = weatherPrecipitationMMB;
+  cmdB.noWaterTimeoutSeconds = validWateringSeconds(boxBNoWaterTimeoutSeconds);
+  cmdB.useRainStopRule = boxBUseRainStopRule;
+
+  if (!cmdB.scheduleEnabled) return;
+
+  String bSlot = matchedScheduleSlotBByGateway();
+  if (bSlot.length() == 0) return;
+
+  String bKey = makeScheduleKeyBByGateway(bSlot);
+  if (bKey == lastBoxBScheduleStartKey || bKey == lastBoxBScheduleSkipKey || bKey == manualStoppedBoxBScheduleKey) {
+    return;
+  }
+
+  if (boxBValve || millis() - lastBoxBScheduleAttemptMillis < SCHEDULE_RETRY_INTERVAL_MS) return;
+  lastBoxBScheduleAttemptMillis = millis();
+
+  if (!offlineScheduleBypassBByGateway() && boxBUseRainStopRule && boxBSensorWet) {
+    boxBRainBlockedToday = true;
+    lastBoxBScheduleSkipKey = bKey;
+    pushEventForBox("boxB", "schedule_skip_sensor_wet_before_start", "B區排程時間到，但雨滴/潮濕感測器在電磁閥尚未開啟前已偵測到濕潤，因此本時段不啟動澆水。" );
+    if (notifyRainBlocked) sendNtfy("🌧️ B 區雨滴暫停", "B區排程時間到，但澆水前已偵測到雨滴/潮濕，已停止本次排程澆水。", "umbrella");
+    firebasePutBool(boxBPath("/rainBlockedToday"), true);
+    firebasePutBool(boxBPath("/rain"), true);
+    firebasePutInt(boxBPath("/scheduleRemainSeconds"), 0);
+    firebasePutInt(boxBPath("/noWaterTimeoutRemainSeconds"), 0);
+    return;
+  }
+
+  if (!canScheduleWaterBByGateway()) {
+    lastBoxBScheduleSkipKey = bKey;
+    pushEventForBox("boxB", "schedule_skip_blocked", "B區排程時間到但條件阻擋，未啟動澆水。請確認天氣、故障或手動狀態。" );
+    if (notifyWeatherBlocked || notifyNoWaterFault) sendNtfy("⚠️ B 區排程未啟動", "B區排程時間到但條件阻擋，未啟動澆水。請確認天氣、故障或手動狀態。", "warning");
+    return;
+  }
+
+  cmdB.startWaterRequest = true;
+  cmdB.offlineScheduleBypass = offlineScheduleBypassBByGateway();
+  cmdB.requestId = millis();
+  if (cmdB.requestId == 0) cmdB.requestId = 1;
+  lastBoxBScheduleStartKey = bKey;
+
+  Serial.print("SCHEDULE B START REQUEST now=");
+  Serial.print(currentHHMM());
+  Serial.print(" s1="); Serial.print(boxBSchedule1);
+  Serial.print(" s2="); Serial.print(boxBSchedule2);
+  Serial.print(" offlineBypass="); Serial.println(offlineScheduleBypassBByGateway());
+
+  pushEventForBox("boxB", "schedule_start_request", "B區排程澆水啟用請求已透過 ESP-NOW 傳送。" );
+
+  // v23: Schedule start is also a one-shot action. Use a short burst so Box B
+  // can catch it even while it is recovering/reconnecting, then clear the action bits.
+  boxBValve = true;
+  boxBRemain = cmdB.wateringSeconds;
+  boxBScheduleRemainSeconds = cmdB.wateringSeconds;
+  boxBValveFault = false;
+  for (int i = 0; i < 80; i++) {
+    sendCommandToB();
+    delay(5);
+  }
+  cmdB.startWaterRequest = false;
+  cmdB.offlineScheduleBypass = false;
+  cmdB.requestId = 0;
+  sendCommandToB();
+}
+
+
+void uploadStatus() {
+  heartbeatSeq++;
+
+  StaticJsonDocument<2048> a;
+  a["singleSensorMode"] = true;
+  a["sensorWet"] = sensorWet;
+  a["rain"] = rainState || rainBlockedToday;
+  a["waterDetected"] = waterDetected;
+  a["wateringConfirmed"] = wateringConfirmed;
+  a["valveFault"] = valveFault;
+  a["faultReason"] = faultReason;
+  a["rainBlockedToday"] = rainBlockedToday;
+  a["wateredToday"] = wateredToday;
+  a["valve"] = valveState;
+  a["ip"] = WiFi.localIP().toString();
+  a["lastUpdate"] = nowString();
+  {
+    JsonObject ts = a.createNestedObject("lastUpdateMs");
+    ts[".sv"] = "timestamp";
+  }
+  a["online"] = true;
+  a["rssi"] = WiFi.RSSI();
+  a["remain"] = remainSeconds();
+  a["scheduleRemainSeconds"] = scheduleRemainSecondsA();
+  a["noWaterTimeoutRemainSeconds"] = noWaterTimeoutRemainSecondsA();
+  a["manualMode"] = manualMode;
+  a["manualValve"] = manualValve;
+  a["desiredValve"] = valveState;
+  a["heartbeatSeq"] = (int)heartbeatSeq;
+  a["heartbeatIntervalSec"] = (int)(HEARTBEAT_INTERVAL_MS / 1000);
+  a["weatherBlocked"] = weatherBlockedA;
+  a["offlineScheduleContinue"] = offlineScheduleContinue;
+  a["commandAckSeq"] = u64ToString(lastCommandSeqAckA);
+  a["lastValveAction"] = lastValveActionStr;
+  a["runtimeNoWaterTimeoutSeconds"] = noWaterTimeoutSeconds;
+  a["runtimeWateringSeconds"] = wateringSeconds;
+  a["scheduleEnabledState"] = scheduleEnabled;
+  a["useRainStopRuleState"] = useRainStopRule;
+  a["localAPActive"] = apRunning;
+  a["localAPSSID"] = AP_SSID;
+  a["localAPIP"] = WiFi.softAPIP().toString();
+
+  String bodyA;
+  serializeJson(a, bodyA);
+  firebasePatchRaw(basePath(), bodyA);
+
+  StaticJsonDocument<2048> b;
+  b["valve"] = boxBValve;
+  b["online"] = boxBOnline;
+  b["rain"] = boxBRainState || boxBRainBlockedToday;
+  b["sensorWet"] = boxBSensorWet;
+  b["waterDetected"] = boxBWaterDetected;
+  b["wateringConfirmed"] = boxBWateringConfirmed;
+  b["valveFault"] = boxBValveFault;
+  b["rainBlockedToday"] = boxBRainBlockedToday;
+  b["wateredToday"] = boxBWateredToday;
+  b["localMode"] = boxBLocalMode;
+  b["localAPActive"] = boxBLocalAPActive;
+  b["localAPSSID"] = "Setup-boxB";
+  b["localAPIP"] = "192.168.4.1";
+  b["remain"] = boxBRemain;
+  b["scheduleRemainSeconds"] = boxBScheduleRemainSeconds;
+  b["noWaterTimeoutRemainSeconds"] = boxBNoWaterTimeoutRemainSeconds;
+  b["heartbeatSeq"] = (int)boxBHeartbeatSeq;
+  b["valveActionSeq"] = (int)boxBValveActionSeq;
+  b["weatherBlocked"] = boxBWeatherBlocked || weatherBlockedB;
+  b["runtimeNoWaterTimeoutSeconds"] = boxBNoWaterTimeoutSeconds;
+  b["runtimeWateringSeconds"] = cmdB.wateringSeconds;
+  b["scheduleEnabledState"] = cmdB.scheduleEnabled;
+  b["commandAckSeq"] = u64ToString(lastCommandSeqAckB);
+  b["useRainStopRuleState"] = boxBUseRainStopRule;
+  b["offlineScheduleContinueState"] = boxBOfflineScheduleContinue;
+  b["offlineScheduleBypass"] = offlineScheduleBypassBByGateway();
+  b["lastUpdate"] = boxBOnline ? nowString() : "offline";
+  if (boxBOnline) {
+    JsonObject tsB = b.createNestedObject("lastUpdateMs");
+    tsB[".sv"] = "timestamp";
+  }
+
+  String bodyB;
+  serializeJson(b, bodyB);
+  firebasePatchRaw("/boxes/boxB", bodyB);
+  statusDirty = false;
+}
+void controlLogicA() {
+  String today = todayString();
+  if (today != "unknown" && today != lastDayState) {
+    lastDayState = today;
+    rainBlockedToday = false;
+    wateredToday = false;
+    wateringConfirmed = false;
+    waterDetected = false;
+    valveFault = false;
+    faultReason = "";
+    lastScheduleStartKeyA = "";
+    lastScheduleSkipKeyA = "";
+    lastNoWaterFaultKeyA = "";
+    manualStoppedScheduleKeyA = "";
+  }
+
+  unsigned long now = millis();
+
+  // 雨滴/潮濕只在排程準備啟動前判斷，不在平常提前鎖死今日排程。
+  if (!rainState) rainWetStartMillis = 0;
+
+  if (manualMode && manualValve) {
+    if (!valveState) {
+      valveFault = false;
+      faultReason = "";
+      waterDetected = false;
+      wateringConfirmed = false;
+      forceValveImmediate(true, "manual_control_sync_on");
+      updateLastValveAction("manual_control_sync_on", "manual sync on");
+    }
+  }
+
+  // Stop conditions must run before schedule re-check, same as Box C.
+  if (valveState) {
+    bool fromSchedule = currentWateringFromScheduleA;
+    bool fromManual = manualMode;
+
+    if (sensorWet && sensorWetStartMillis > 0 && now - sensorWetStartMillis >= RAIN_BLOCK_CONFIRM_MS && !wateringConfirmed) {
+      markWaterConfirmed();
+      firebasePutInt(ownPath("/noWaterTimeoutRemainSeconds"), 0);
+    }
+
+    bool offlineScheduleRunA = fromSchedule && offlineScheduleBypassA();
+
+    if ((fromSchedule || fromManual) && !offlineScheduleRunA && !wateringConfirmed && now - valveStartMillis >= noWaterTimeoutMsA()) {
+      String faultKey = currentScheduleKeyA.length() > 0 ? currentScheduleKeyA : String(millis());
+      bool wasSchedule = fromSchedule;
+      bool wasManual = fromManual;
+
+      if (wasSchedule) markCurrentScheduleHandledA("schedule_no_water_fault_recorded");
+      currentWateringFromScheduleA = false;
+      currentScheduleKeyA = "";
+      manualMode = false;
+      manualValve = false;
+      autoMode = true;
+      waterDetected = false;
+      wateringConfirmed = false;
+      valveFault = true;
+      faultReason = "no water detected within timeout";
+      if (wasSchedule) scheduleEnabled = false;
+
+      forceValveImmediate(false, "fault_off");
+      updateLastValveAction("fault_off", faultReason);
+      Serial.println("Valve fault: no water detected within timeout, valve forced OFF before schedule re-check");
+
+      firebasePutBool(ownPath("/valve"), false);
+      firebasePutBool(ownPath("/desiredValve"), false);
+      firebasePutBool(ownPath("/manualMode"), false);
+      firebasePutBool(ownPath("/manualValve"), false);
+      firebasePutBool(ownPath("/waterDetected"), false);
+      firebasePutBool(ownPath("/wateringConfirmed"), false);
+      firebasePutInt(ownPath("/scheduleRemainSeconds"), 0);
+      firebasePutInt(ownPath("/noWaterTimeoutRemainSeconds"), 0);
+      firebasePutBool(ownPath("/valveFault"), true);
+      firebasePutString(ownPath("/faultReason"), faultReason);
+      if (wasSchedule) firebasePutBool(ownPath("/scheduleEnabled"), false);
+
+      if (wasSchedule && faultKey != lastNoWaterFaultKeyA) {
+        lastNoWaterFaultKeyA = faultKey;
+        pushEvent("schedule_no_water_fault", String("A區排程澆水啟用後 ") + String(noWaterTimeoutSeconds) + " 秒內沒有穩定偵測到水，已強制關閉電磁閥、關閉排程模式，並將排程秒數清零。");
+      } else if (wasManual) {
+        pushEvent("manual_no_water_fault", String("A區手動澆水開啟後 ") + String(noWaterTimeoutSeconds) + " 秒內沒有穩定偵測到水，已自動關閉電磁閥並離開手動模式。");
+      }
+      if (notifyNoWaterFault) sendNtfy("⚠️ A 區無水故障", "A區出水偵測逾時，已自動關閉電磁閥。", "warning");
+      statusDirty = true;
+      return;
+    }
+
+    if (fromSchedule && now - valveStartMillis >= (unsigned long)wateringSeconds * 1000UL) {
+      wateredToday = true;
+      markCurrentScheduleHandledA("schedule_watering_done_recorded");
+      currentWateringFromScheduleA = false;
+      currentScheduleKeyA = "";
+      waterDetected = false;
+      wateringConfirmed = false;
+      forceValveImmediate(false, "time_off");
+      updateLastValveAction("time_off", "schedule watering done");
+      firebasePutBool(ownPath("/valve"), false);
+      firebasePutBool(ownPath("/desiredValve"), false);
+      firebasePutInt(ownPath("/scheduleRemainSeconds"), 0);
+      firebasePutInt(ownPath("/noWaterTimeoutRemainSeconds"), 0);
+      pushEvent("schedule_done", String("A區排程澆水完成，已澆水 ") + String(wateringSeconds) + " 秒。此時段已記錄，不會重複啟動。");
+      statusDirty = true;
+      return;
+    }
+  }
+
+  // manualMode=true + manualValve=false means 手動排程模式；仍允許排程。
+  if (!(manualMode && manualValve)) {
+    if (now - lastScheduleWatchPrintA >= 10000UL) {
+      lastScheduleWatchPrintA = now;
+      printScheduleWatchA();
+    }
+
+    String slot = matchedScheduleSlotA();
+    if (scheduleEnabled && slot.length() > 0) {
+      String scheduleKey = makeScheduleKeyA(slot);
+      if (scheduleKey == lastScheduleStartKeyA || scheduleKey == lastScheduleSkipKeyA || scheduleKey == manualStoppedScheduleKeyA) {
+        if (lastValveActionStr != "schedule_slot_already_handled") {
+          Serial.print("SCHEDULE A SKIP: slot already handled key=");
+          Serial.println(scheduleKey);
+        }
+        lastValveActionStr = "schedule_slot_already_handled";
+        return;
+      }
+
+      if (!valveState && now - lastScheduleAttemptMillis >= SCHEDULE_RETRY_INTERVAL_MS) {
+        lastScheduleAttemptMillis = now;
+        if (!offlineScheduleBypassA() && rainSensorShouldBlockScheduleNowA(now)) {
+          rainBlockedToday = true;
+          rainState = true;
+          lastScheduleSkipKeyA = scheduleKey;
+          updateLastValveAction("schedule_skip_sensor_wet_before_start", "rain sensor wet before schedule start");
+          pushEvent("schedule_skip_sensor_wet_before_start", "A區排程時間到，但雨滴/潮濕感測器在電磁閥尚未開啟前已偵測到濕潤，因此本時段不啟動澆水。");
+          if (notifyRainBlocked) sendNtfy("🌧️ A 區雨滴暫停", "A區排程時間到，但澆水前已偵測到雨滴/潮濕，已停止本次排程澆水。", "umbrella");
+          firebasePutBool(ownPath("/rainBlockedToday"), true);
+          firebasePutBool(ownPath("/rain"), true);
+          firebasePutInt(ownPath("/scheduleRemainSeconds"), 0);
+          firebasePutInt(ownPath("/noWaterTimeoutRemainSeconds"), 0);
+          statusDirty = true;
+          return;
+        } else if (!canScheduleWaterA()) {
+          lastScheduleSkipKeyA = scheduleKey;
+          updateLastValveAction("schedule_skip_blocked", "weather/fault/manual block");
+          pushEvent("schedule_skip_blocked", "A區排程時間到但條件阻擋，未啟動澆水。請確認天氣、故障或手動狀態。");
+          if (notifyRainBlocked || notifyWeatherBlocked || notifyNoWaterFault) sendNtfy("⚠️ A 區排程未啟動", "A區排程時間到但條件阻擋，未啟動澆水。請確認天氣、故障或手動狀態。", "warning");
+          statusDirty = true;
+          return;
+        } else {
+          currentWateringFromScheduleA = true;
+          currentScheduleKeyA = scheduleKey;
+          Serial.print("SCHEDULE A START: valve ON, noWaterTimeout=");
+          Serial.print(noWaterTimeoutSeconds);
+          Serial.print("s wateringSeconds=");
+          Serial.println(wateringSeconds);
+          forceValveImmediate(true, "schedule_on");
+          updateLastValveAction("schedule_on", "schedule start");
+          lastScheduleStartKeyA = scheduleKey;
+          pushEvent("schedule_start", String("A區排程澆水啟用，最大澆水 ") + String(wateringSeconds) + " 秒，出水偵測逾時 " + String(noWaterTimeoutSeconds) + " 秒。");
+          if (notifyStartWater) sendNtfy("🚿 A 區排程澆水啟用", "A區排程已啟動。", "droplet");
+          statusDirty = true;
+          return;
+        }
+      }
+    }
+  }
+}
+
+String htmlHeader(String title) {
+  String h = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+  h.concat("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+  h.concat("<title>");
+  h.concat(title);
+  h.concat("</title>");
+  h.concat("<style>");
+  h.concat("body{font-family:Arial;padding:20px;background:#f4f4f4}");
+  h.concat(".card{background:white;padding:16px;border-radius:12px;margin-bottom:16px}");
+  h.concat("input,select,button{width:100%;padding:10px;margin:6px 0;font-size:16px;box-sizing:border-box}");
+  h.concat("button{background:#2196f3;color:white;border:0;border-radius:8px}");
+  h.concat("a{display:block;margin:10px 0;font-size:18px}");
+  h.concat("</style></head><body>");
+  return h;
+}
+
+
+void holdAPConfigWindow(const char *reason) {
+  apConfigHoldUntil = millis() + AP_CONFIG_HOLD_MS;
+  Serial.print("AP config hold 5 minutes reason=");
+  Serial.println(reason ? reason : "");
+}
+
+bool apConfigHoldActive() {
+  if (!apRunning) return false;
+  return (long)(apConfigHoldUntil - millis()) > 0;
+}
+
+String htmlHome() {
+  String html;
+  html.reserve(6000);
+
+  html += "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>Box A Gateway</title>";
+  html += "<style>";
+  html += "body{font-family:Arial;background:#0b1220;color:#fff;margin:0;padding:16px;}";
+  html += ".card{background:#182233;border-radius:18px;padding:16px;margin-bottom:14px;}";
+  html += "h1{font-size:24px;} h2{font-size:18px;color:#8ecbff;}";
+  html += ".row{display:flex;justify-content:space-between;border-bottom:1px solid #2c3b52;padding:8px 0;gap:12px;}";
+  html += "button,input{width:100%;padding:12px;margin-top:8px;border-radius:12px;border:0;font-size:16px;box-sizing:border-box;}";
+  html += "button{background:#0a84ff;color:white;font-weight:bold;}";
+  html += ".red{background:#ff453a;}.gray{background:#6b7888;}";
+  html += "</style></head><body>";
+
+  html += "<h1>Box A Gateway</h1>";
+
+  html += "<div class='card'><h2>Status</h2>";
+  html += "<div class='row'><span>Role</span><b>Gateway / Firebase / ESP-NOW</b></div>";
+  html += "<div class='row'><span>WiFi</span><b>";
+  html += WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected";
+  html += "</b></div>";
+  html += "<div class='row'><span>IP</span><b>";
+  html += WiFi.localIP().toString();
+  html += "</b></div>";
+  html += "<div class='row'><span>RSSI</span><b>";
+  html += String(WiFi.RSSI());
+  html += "</b></div>";
+  html += "<div class='row'><span>Box B</span><b>";
+  html += boxBOnline ? "Online" : "Offline";
+  html += "</b></div>";
+  html += "<div class='row'><span>Box A Valve</span><b>";
+  html += valveState ? "ON" : "OFF";
+  html += "</b></div>";
+  html += "</div>";
+
+  html += "<div class='card'><h2>Manual Control</h2>";
+  html += "<button onclick=\"location.href='/on'\">Open Valve</button>";
+  html += "<button class='red' onclick=\"location.href='/off'\">Close Valve</button>";
+  html += "<button class='gray' onclick=\"location.href='/auto'\">Resume Auto Mode</button>";
+  html += "<button class='gray' onclick=\"location.href='/clear'\">Clear Today Status / Fault</button>";
+  html += "</div>";
+
+  html += "<div class='card'><h2>System</h2>";
+  html += "<button onclick=\"location.href='/status'\">View JSON Status</button>";
+  html += "<button onclick=\"location.href='/ota'\">OTA Update</button>";
+  html += "<button class='gray' onclick=\"location.href='/wifi'\">WiFi Setup / Connect WiFi</button>";
+  html += "<button class='red' onclick=\"location.href='/restart'\">Restart</button>";
+  html += "</div>";
+
+  html += "</body></html>";
+  return html;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", htmlHome());
+}
+
+void handleWiFiPage() {
+  // 快速設定頁：不要在頁面載入時自動 WiFi 掃描。
+  // WiFi.scanNetworks() 在 ESP32 AP+STA 模式可能卡數秒，會讓手機覺得 192.168.4.1 很久才開。
+  holdAPConfigWindow("wifi_page");
+
+  String h = htmlHeader("Box A WiFi setup");
+  h.concat("<div class='card'><h2>快速連線 WiFi</h2>");
+  h.concat("<p>建議直接手動輸入 2.4G WiFi 名稱與密碼。此頁不會自動掃描，所以會比較快。</p>");
+  h.concat("<form method='POST' action='/savewifi'>");
+  h.concat("<label>WiFi SSID</label>");
+  h.concat("<input name='manualssid' placeholder='例如 TOTOLINK_8828C42.4' autocomplete='off'>");
+  h.concat("<label>WiFi password</label>");
+  h.concat("<input name='pass' type='password' placeholder='Password' autocomplete='off'>");
+  h.concat("<button type='submit'>儲存 WiFi 並重新啟動</button>");
+  h.concat("</form>");
+  h.concat("<button class='gray' onclick=\"location.href='/wifiscan'\">掃描附近 WiFi</button>");
+  h.concat("<button class='gray' onclick=\"location.href='/'\">返回首頁</button>");
+  h.concat("</div></body></html>");
+
+  server.send(200, "text/html", h);
+}
+
+void handleWiFiScanPage() {
+  holdAPConfigWindow("wifi_scan_page");
+
+  // v11 speed fix:
+  // Do not run WiFi.scanNetworks() inside this page handler.
+  // A blocking scan in AP+STA mode can freeze 192.168.4.1 for several seconds.
+  // The page now opens immediately, then asks /scanjson to scan asynchronously.
+  String h = htmlHeader("Box A WiFi scan");
+  h.concat("<div class='card'><h2>選擇附近 WiFi</h2>");
+  h.concat("<p>頁面會先立即開啟，WiFi 清單會在背景掃描後自動出現。若清單太慢，可直接手動輸入 SSID。</p>");
+  h.concat("<form method='POST' action='/savewifi'>");
+  h.concat("<label>Select WiFi</label>");
+  h.concat("<select id='ssidSelect' name='ssid'><option value=''>正在準備掃描...</option></select>");
+  h.concat("<label>Or type WiFi name</label>");
+  h.concat("<input name='manualssid' placeholder='WiFi SSID' autocomplete='off'>");
+  h.concat("<label>WiFi password</label>");
+  h.concat("<input name='pass' type='password' placeholder='Password' autocomplete='off'>");
+  h.concat("<button type='submit'>儲存 WiFi 並重新啟動</button>");
+  h.concat("</form>");
+  h.concat("<button class='gray' onclick=\"location.href='/wifi'\">返回快速輸入</button>");
+  h.concat("<p id='scanStatus'>尚未開始掃描</p>");
+  h.concat("</div>");
+  h.concat("<script>");
+  h.concat("let firstScan=true;");
+  h.concat("function pollScan(){let url='/scanjson'+(firstScan?'?start=1':'');firstScan=false;fetch(url,{cache:'no-store'}).then(r=>r.json()).then(d=>{");
+  h.concat("let st=document.getElementById('scanStatus');let sel=document.getElementById('ssidSelect');");
+  h.concat("if(d.running){st.textContent='正在掃描 WiFi，請稍候...';setTimeout(pollScan,1500);return;}");
+  h.concat("if(!d.networks||d.networks.length===0){st.textContent='沒有掃到 WiFi，可直接手動輸入 SSID。';sel.innerHTML='<option value=\\\"\\\">未掃到 WiFi</option>';return;}");
+  h.concat("sel.innerHTML='';d.networks.forEach(n=>{let o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+' ('+n.rssi+' dBm, CH '+n.ch+')';sel.appendChild(o);});");
+  h.concat("st.textContent='掃描完成，共 '+d.networks.length+' 個 WiFi。';");
+  h.concat("}).catch(e=>{document.getElementById('scanStatus').textContent='掃描讀取失敗，請重新整理或手動輸入。';});}");
+  h.concat("window.addEventListener('load',pollScan);");
+  h.concat("</script></body></html>");
+
+  server.send(200, "text/html", h);
+}
+
+void handleWiFiScanJson() {
+  holdAPConfigWindow("wifi_scan_json");
+
+  int scanStatus = WiFi.scanComplete();
+  bool startRequested = server.hasArg("start");
+  unsigned long now = millis();
+
+  if (startRequested && scanStatus != -1 && (now - lastAsyncWifiScanStart > WIFI_SCAN_RESTART_GUARD_MS)) {
+    WiFi.scanDelete();
+    int r = WiFi.scanNetworks(true, true);  // async=true, show_hidden=true
+    asyncWifiScanRunning = true;
+    lastAsyncWifiScanStart = now;
+    Serial.print("Async WiFi scan start result=");
+    Serial.println(r);
+    server.send(200, "application/json", "{\"running\":true}");
+    return;
+  }
+
+  scanStatus = WiFi.scanComplete();
+  if (scanStatus == -1) {
+    server.send(200, "application/json", "{\"running\":true}");
+    return;
+  }
+
+  if (scanStatus < 0) {
+    int r = WiFi.scanNetworks(true, true);
+    asyncWifiScanRunning = true;
+    lastAsyncWifiScanStart = now;
+    Serial.print("Async WiFi scan auto-start result=");
+    Serial.println(r);
+    server.send(200, "application/json", "{\"running\":true}");
+    return;
+  }
+
+  String json = "{\"running\":false,\"count\":";
+  json.concat(String(scanStatus));
+  json.concat(",\"networks\":[");
+  for (int i = 0; i < scanStatus; i++) {
+    if (i > 0) json.concat(",");
+    json.concat("{\"ssid\":\"");
+    json.concat(jsonEscape(WiFi.SSID(i)));
+    json.concat("\",\"rssi\":");
+    json.concat(String(WiFi.RSSI(i)));
+    json.concat(",\"ch\":");
+    json.concat(String(WiFi.channel(i)));
+    json.concat(",\"bssid\":\"");
+    json.concat(WiFi.BSSIDstr(i));
+    json.concat("\"}");
+  }
+  json.concat("]}");
+
+  WiFi.scanDelete();
+  asyncWifiScanRunning = false;
+  server.send(200, "application/json", json);
+}
+
+void handleSaveWiFi() {
+  holdAPConfigWindow("save_wifi");
+
+  String ssid = server.arg("manualssid");
+  if (ssid.length() == 0) ssid = server.arg("ssid");
+  ssid.trim();
+  String pass = server.arg("pass");
+
+  saveWiFi(ssid, pass);
+
+  String h = htmlHeader("WiFi saved");
+  h.concat("<div class='card'><h2>WiFi 已儲存</h2>");
+  h.concat("<p>SSID：");
+  h.concat(htmlEscape(ssid));
+  h.concat("</p><p>Box A 會在 3 秒後重新啟動並嘗試連線。</p>");
+  h.concat("<p>如果連線失敗，Setup-boxA 會重新開啟。</p></div></body></html>");
+  server.send(200, "text/html", h);
+  delay(3000);
+  ESP.restart();
+}
+
+void handleOn() {
+  manualMode = true;
+  manualValve = true;
+  autoMode = false;
+  valveFault = false;
+  faultReason = "";
+  waterDetected = false;
+  wateringConfirmed = false;
+  forceValveImmediate(true, "local_web_manual_on");
+  updateLastValveAction("local_web_manual_on", "local web manual on");
+  uploadStatus();
+  server.sendHeader("Location", "/");
+  server.send(302);
+}
+
+void handleOff() {
+  if (currentWateringFromScheduleA) markCurrentScheduleHandledA("schedule_local_manual_stop_recorded");
+  waterDetected = false;
+  wateringConfirmed = false;
+  currentWateringFromScheduleA = false;
+  currentScheduleKeyA = "";
+  forceValveImmediate(false, "local_web_manual_off");
+  manualMode = false;
+  manualValve = false;
+  autoMode = true;
+  updateLastValveAction("local_web_manual_off", "local web manual off");
+  uploadStatus();
+  server.sendHeader("Location", "/");
+  server.send(302);
+}
+
+void handleAuto() {
+  manualMode = false;
+  manualValve = false;
+  autoMode = true;
+  currentWateringFromScheduleA = false;
+  currentScheduleKeyA = "";
+  forceValveImmediate(false, "local_web_auto_resume");
+  updateLastValveAction("local_web_auto_resume", "local web auto resume");
+  uploadStatus();
+  server.sendHeader("Location", "/");
+  server.send(302);
+}
+
+void handleClear() {
+  clearTodayState();
+  server.sendHeader("Location", "/");
+  server.send(302);
+}
+
+String htmlOTA() {
+  String html;
+  html.reserve(3000);
+
+  html += "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>OTA Update</title>";
+  html += "<style>";
+  html += "body{font-family:Arial;background:#0b1220;color:white;padding:16px;}";
+  html += ".card{background:#182233;border-radius:18px;padding:16px;}";
+  html += "input,button{width:100%;padding:12px;margin-top:12px;border-radius:12px;border:0;font-size:16px;box-sizing:border-box;}";
+  html += "button{background:#0a84ff;color:white;font-weight:bold;}";
+  html += "</style></head><body>";
+  html += "<div class='card'>";
+  html += "<h1>OTA Update</h1>";
+  html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
+  html += "<input type='file' name='firmware'>";
+  html += "<button type='submit'>Upload Firmware</button>";
+  html += "</form>";
+  html += "<button onclick=\"location.href='/'\">Back Home</button>";
+  html += "</div>";
+  html += "</body></html>";
+
+  return html;
+}
+
+void handleUpdatePage() {
+  server.send(200, "text/html", htmlOTA());
+}
+
+void handleStatus() {
+  String json = "{";
+  json += "\"box\":\"";
+  json += BOX_ID;
+  json += "\",";
+  json += "\"ip\":\"";
+  json += WiFi.localIP().toString();
+  json += "\",";
+  json += "\"rssi\":";
+  json += String(WiFi.RSSI());
+  json += ",";
+  json += "\"valve\":";
+  json += valveState ? "true" : "false";
+  json += ",";
+  json += "\"sensorWet\":";
+  json += sensorWet ? "true" : "false";
+  json += ",";
+  json += "\"fault\":";
+  json += valveFault ? "true" : "false";
+  json += ",";
+  json += "\"boxBOnline\":";
+  json += boxBOnline ? "true" : "false";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void setupWebServer() {
+  if (webServerStarted) return;
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/wifi", HTTP_GET, handleWiFiPage);
+  server.on("/wifiscan", HTTP_GET, handleWiFiScanPage);
+  server.on("/scanjson", HTTP_GET, handleWiFiScanJson);
+  server.on("/savewifi", HTTP_POST, handleSaveWiFi);
+  server.on("/on", HTTP_GET, handleOn);
+  server.on("/off", HTTP_GET, handleOff);
+  server.on("/auto", HTTP_GET, handleAuto);
+  server.on("/clear", HTTP_GET, handleClear);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/ota", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/restart", HTTP_GET, []() {
+    server.send(200, "text/plain", "Restarting...");
+    delay(500);
+    ESP.restart();
+  });
+
+  server.on("/update", HTTP_POST, []() {
+    server.send(200, "text/plain", Update.hasError() ? "Update failed" : "Update complete. Restarting.");
+    delay(1000);
+    ESP.restart();
+  }, []() {
+    HTTPUpload& upload = server.upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      Update.write(upload.buf, upload.currentSize);
+    } else if (upload.status == UPLOAD_FILE_END) {
+      Update.end(true);
+    }
+  });
+
+  server.onNotFound([]() {
+    server.sendHeader("Location", String("http://192.168.4.1/"), true);
+    server.send(302, "text/plain", "Redirect to setup page");
+  });
+
+  server.begin();
+  webServerStarted = true;
+  Serial.println("WebServer started on port 80");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println("BOX A v23 fast Box B OFF + offline schedule bypass");
+  Serial.println("==============================");
+
+  pinMode(PIN_VALVE, OUTPUT);
+  digitalWrite(PIN_VALVE, LOW);
+  pinMode(PIN_RAIN, INPUT_PULLUP);
+
+  // v19: Do NOT call server.begin() before WiFi.mode()/AP init.
+  // ESP32-C3 can assert in xQueueSemaphoreTake if WebServer starts before WiFi stack is ready.
+  loadScheduleSettingsFromNVS();
+  wifiOK = connectWiFi();
+
+  if (!wifiOK) {
+    Serial.println("WiFi not connected. Start Setup-boxA AP on fallback channel. Router WiFi setup can still scan/connect other channels.");
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_channel(ESPNOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    if (BOXA_AUTO_START_AP_WHEN_WIFI_FAIL) startAPMode();
+    // v19: Start WebServer only after WiFi/AP is initialized.
+    setupWebServer();
+    initEspNow();
+    espNowStartupDiscoveryBurst("offline_boot");
+  } else {
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("RSSI: ");
+    Serial.println(WiFi.RSSI());
+    Serial.print("WiFi channel: ");
+    Serial.println(WiFi.channel());
+
+    // v19: WebServer is safe after WiFi is connected.
+    setupWebServer();
+    MDNS.begin(HOSTNAME);
+    configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    waitForTimeSync();
+
+    initFirebase();
+    primeCommandSeqsFromFirebase("wifi_boot_no_replay");
+    initEspNow();
+    espNowStartupDiscoveryBurst("wifi_boot_after_prime_no_replay");
+    readFirebaseSettings();
+    uploadStatus();
+    readNotifySettings();
+    fetchWeatherForBox("boxA");
+    delay(1000);
+    fetchWeatherForBox("boxB");
+    lastWeatherFetch = millis();
+    sendNtfy("✅ A 區上線", "Box A Gateway connected to WiFi", "white_check_mark");
+  }
+
+  setupWebServer();  // guarded; safe fallback only after WiFi/AP init
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  // Highest priority: read manual Firebase commands first.
+  if (wifiOK && now - lastFastCommandRead >= FAST_COMMAND_INTERVAL_MS) {
+    lastFastCommandRead = now;
+    readFastCommand();
+  }
+
+  if (WiFi.status() != WL_CONNECTED && now - lastWiFiReconnect >= WIFI_RECONNECT_INTERVAL_MS) {
+    lastWiFiReconnect = now;
+
+    // v11 speed fix:
+    // When Setup-boxA AP is active, do NOT run background WiFi scan/reconnect.
+    // connectWiFi() performs scan + connect waits and can freeze/drop the AP page.
+    // WiFi reconnect is done after the user saves WiFi and the device restarts.
+    if (apRunning) {
+      wifiOK = false;
+      Serial.println("Setup-boxA AP active. Skip background WiFi reconnect to keep AP web page fast.");
+    } else if (apConfigHoldActive()) {
+      Serial.println("AP setup page active. Skip background WiFi reconnect to keep Setup-boxA responsive.");
+    } else {
+      Serial.println("WiFi disconnected. Reconnecting...");
+      wifiOK = connectWiFi();
+      if (wifiOK) {
+        Serial.println("WiFi reconnect SUCCESS");
+        configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+        waitForTimeSync();
+        initFirebase();
+        initEspNow();
+        readFirebaseSettings();
+        primeCommandSeqsFromFirebase("wifi_reconnect_no_replay");
+        uploadStatus();
+        if (apRunning) startAPMode();
+      } else {
+        Serial.println("WiFi reconnect FAILED. Keep/start Setup-boxA AP on fallback channel.");
+        WiFi.mode(WIFI_STA);
+        WiFi.setSleep(false);
+        esp_wifi_set_channel(ESPNOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        if (BOXA_AUTO_START_AP_WHEN_WIFI_FAIL && !apRunning) startAPMode();
+        initEspNow();
+      }
+    }
+  }
+
+  if (now - lastSensorRead >= 1000) {
+    lastSensorRead = now;
+    readSensors();
+  }
+
+
+  if (now - lastControlLogicA >= 1000UL) {
+    lastControlLogicA = now;
+    controlLogicA();
+    controlLogicBByGateway();
+  }
+
+  // ESP-NOW must keep running even when Firebase/WiFi is slow or offline.
+  // This also lets Box B catch Box A while it is hopping channels.
+  unsigned long espNowInterval = boxBOnline ? 1000UL : BOXB_ESPNOW_SEND_INTERVAL_MS;
+  if (espNowReady && now - lastBoxBCommandSend >= espNowInterval) {
+    lastBoxBCommandSend = now;
+    sendCommandToB();
+  }
+
+  if (wifiOK && now - lastFirebaseSync >= HEARTBEAT_INTERVAL_MS) {
+    lastFirebaseSync = now;
+    uploadStatus();
+    controlLogicA();
+    sendCommandToB();
+  }
+
+  if (wifiOK && now - lastSettingsRead >= SETTINGS_READ_INTERVAL_MS) {
+    lastSettingsRead = now;
+    readFirebaseSettings();
+    controlLogicA();
+    sendCommandToB();
+  }
+
+  if (wifiOK && now - lastNotifySettingsRead >= NOTIFY_SETTINGS_READ_INTERVAL_MS) {
+    lastNotifySettingsRead = now;
+    readNotifySettings();
+  }
+
+  if (wifiOK && now - lastWeatherFetch >= WEATHER_FETCH_INTERVAL_MS) {
+    lastWeatherFetch = now;
+    fetchWeatherForBox("boxA");
+    delay(1000);
+    fetchWeatherForBox("boxB");
+  }
+
+  if (apRunning && millis() - apStartMillis >= AP_ACTIVE_TIME_MS) {
+    if (WiFi.status() == WL_CONNECTED) {
+      stopAPMode();
+      initEspNow();
+    } else {
+      apStartMillis = millis();
+      Serial.println("No router WiFi. Keep Setup-boxA AP active for setup and ESP-NOW same-channel operation.");
+    }
+  }
+
+  bool boxBTimedOut = (lastBoxBSeen == 0 || millis() - lastBoxBSeen > BOXB_TIMEOUT_MS);
+  if (boxBTimedOut) {
+    boxBOnline = false;
+    boxBRemain = 0;
+    if (!boxBOfflineNotified && notifyOffline && wifiOK) {
+      boxBOfflineNotified = true;
+      String msg = "Box B 超過時間沒有回傳 heartbeat\n時間：";
+      msg.concat(nowString());
+      sendNtfy("⚠️ Box B 離線", msg, "warning");
+    }
+  }
+
+  if (now - lastHeapPrint >= 10000) {
+    lastHeapPrint = now;
+    Serial.print("Free heap: ");
+    Serial.println(ESP.getFreeHeap());
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("RSSI: ");
+      Serial.println(WiFi.RSSI());
+    }
+  }
+}
